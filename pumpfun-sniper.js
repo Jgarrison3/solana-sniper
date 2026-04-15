@@ -1,379 +1,284 @@
 /**
- * PUMP.FUN SNIPER BOT
+ * PUMP.FUN MAX PROFIT SNIPER v3
  * ═══════════════════════════════════════════════════════════════
- * Strategy: Monitor pump.fun for new token launches via WebSocket.
- *           Filter by momentum signals. Buy early, exit fast.
- *
- * SETUP:
- *   npm install @solana/web3.js node-fetch dotenv bs58 ws
- *
- * CONFIG:
- *   Create a .env file:
- *     PRIVATE_KEY=your_base58_private_key
- *     RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
- *
- * RUN:
- *   node pumpfun-sniper.js
+ * Goal: Maximize SOL in 24 hours.
+ * Strategy: Aggressive early entry, adaptive exits, reinvest profits.
+ * Brain: Learns which tokens/patterns pump. Gets smarter every trade.
  * ═══════════════════════════════════════════════════════════════
  */
 
 require('dotenv').config();
-const { Connection, Keypair, VersionedTransaction, PublicKey } = require('@solana/web3.js');
+const { Connection, Keypair, VersionedTransaction } = require('@solana/web3.js');
 const fetch = require('node-fetch');
 const WebSocket = require('ws');
 const bs58 = require('bs58').default || require('bs58');
 const fs = require('fs');
 
-// ─── CONFIG ────────────────────────────────────────────────────
+const BRAIN_FILE = './brain.json';
 
-const CONFIG = {
-  RPC_URL: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
-  SOL_PER_SNIPE: 0.05,
-  MAX_CONCURRENT_POSITIONS: 5,
-  MAX_TOTAL_SPENT_SOL: 0.5,
-  TAKE_PROFIT_PCT: 1.50,
-  STOP_LOSS_PCT: 0.50,
-  MAX_HOLD_SECONDS: 300,
-  MIN_INITIAL_BUY_SOL: 0.5,
-  MIN_UNIQUE_BUYERS_TO_CONFIRM: 3,
-  CONFIRM_WINDOW_MS: 20000,
-  SLIPPAGE_BPS: 2000,
-  PUMPFUN_WS: 'wss://pumpportal.fun/api/data',
-  SOL_MINT: 'So11111111111111111111111111111111111111112',
-  LOG_FILE: './sniper-trades.json',
-  RUNTIME_MS: 24 * 60 * 60 * 1000,
-};
+function log(msg) {
+  const ts = new Date().toISOString();
+  const line = `[${ts}] ${msg}`;
+  console.log(line);
+  try { fs.appendFileSync('./sniper.log', line + '\n'); } catch (e) {}
+}
+
+function loadBrain() {
+  try {
+    if (fs.existsSync(BRAIN_FILE)) {
+      const b = JSON.parse(fs.readFileSync(BRAIN_FILE));
+      log(`🧠 Brain loaded: ${b.totalTrades} trades | ${b.wins}W/${b.losses}L | PnL: ${b.totalPnlSOL > 0 ? '+' : ''}${b.totalPnlSOL.toFixed(4)} SOL`);
+      return b;
+    }
+  } catch (e) {}
+  return {
+    totalTrades: 0,
+    wins: 0,
+    losses: 0,
+    totalPnlSOL: 0,
+    avgWinPct: 0,
+    avgLossPct: 0,
+    avgHoldTimeWin: 0,
+    takeProfit: 1.00,
+    stopLoss: 0.40,
+    maxHoldSec: 240,
+    solPerSnipe: 0.05,
+    minDevBuy: 0.05,
+    minBuyers: 2,
+    confirmWindowMs: 60000,
+    streak: 0,
+    bestStreak: 0,
+    recentTrades: [],
+    devBuyStats: {},
+    startingBalance: 0,
+  };
+}
+
+function saveBrain() {
+  fs.writeFileSync(BRAIN_FILE, JSON.stringify(brain, null, 2));
+}
+
+function adapt() {
+  const { totalTrades, wins, recentTrades, streak } = brain;
+  if (totalTrades < 2) return;
+
+  const recent = recentTrades.slice(-6);
+  const recentWinRate = recent.length > 0 ? recent.filter(t => t.pnl > 0).length / recent.length : 0.5;
+
+  const balanceGrowth = state.solBalance / (brain.startingBalance || state.solBalance);
+  if (balanceGrowth > 1.5) {
+    brain.solPerSnipe = Math.min(0.20, brain.solPerSnipe * 1.15);
+    log(`🧠 Balance up ${((balanceGrowth - 1) * 100).toFixed(0)}% — scaling to ${brain.solPerSnipe.toFixed(3)} SOL/trade`);
+  } else if (balanceGrowth < 0.7) {
+    brain.solPerSnipe = Math.max(0.02, brain.solPerSnipe * 0.85);
+    log(`🧠 Balance down — scaling back to ${brain.solPerSnipe.toFixed(3)} SOL/trade`);
+  }
+
+  if (streak >= 3) {
+    brain.takeProfit = Math.min(3.0, brain.takeProfit * 1.2);
+    log(`🧠 Hot streak (${streak}) — raising TP to ${(brain.takeProfit * 100).toFixed(0)}%`);
+  } else if (recentWinRate > 0.6) {
+    brain.takeProfit = Math.min(2.5, brain.takeProfit * 1.1);
+  } else if (recentWinRate < 0.3) {
+    brain.takeProfit = Math.max(0.50, brain.takeProfit * 0.9);
+    log(`🧠 Cold — lowering TP to ${(brain.takeProfit * 100).toFixed(0)}%`);
+  }
+
+  if (streak <= -3) {
+    brain.stopLoss = Math.max(0.20, brain.stopLoss * 0.85);
+    log(`🧠 Loss streak (${streak}) — tightening SL to ${(brain.stopLoss * 100).toFixed(0)}%`);
+  } else if (streak >= 3) {
+    brain.stopLoss = Math.min(0.55, brain.stopLoss * 1.1);
+  }
+
+  if (brain.avgHoldTimeWin > 0) {
+    brain.maxHoldSec = Math.round(Math.min(360, Math.max(60, brain.avgHoldTimeWin * 1.8)));
+  }
+
+  if (recentWinRate < 0.25 && totalTrades >= 5) {
+    brain.minBuyers = Math.min(4, brain.minBuyers + 1);
+    brain.minDevBuy = Math.min(0.5, brain.minDevBuy * 1.5);
+    log(`🧠 Too many rugs — raising entry bar: ${brain.minBuyers} buyers, ${brain.minDevBuy.toFixed(2)} SOL dev buy`);
+  } else if (recentWinRate > 0.6 && totalTrades >= 5) {
+    brain.minBuyers = Math.max(1, brain.minBuyers - 1);
+    brain.minDevBuy = Math.max(0.05, brain.minDevBuy * 0.8);
+    log(`🧠 Winning — lowering entry bar to catch more trades`);
+  }
+
+  saveBrain();
+}
+
+function recordTrade(pnlSOL, pnlPct, holdTime, devBuy, reason) {
+  brain.recentTrades.push({ pnl: pnlSOL, pct: pnlPct, holdTime, devBuy, reason, time: Date.now() });
+  if (brain.recentTrades.length > 30) brain.recentTrades.shift();
+
+  brain.totalTrades++;
+  brain.totalPnlSOL += pnlSOL;
+
+  if (pnlSOL > 0) {
+    brain.wins++;
+    brain.streak = Math.max(0, brain.streak) + 1;
+    brain.bestStreak = Math.max(brain.bestStreak, brain.streak);
+    brain.avgWinPct = ((brain.avgWinPct * (brain.wins - 1)) + pnlPct) / brain.wins;
+    brain.avgHoldTimeWin = ((brain.avgHoldTimeWin * (brain.wins - 1)) + holdTime) / brain.wins;
+  } else {
+    brain.losses++;
+    brain.streak = Math.min(0, brain.streak) - 1;
+    brain.avgLossPct = ((brain.avgLossPct * (brain.losses - 1)) + pnlPct) / brain.losses;
+  }
+
+  const bucket = devBuy < 0.5 ? 'micro' : devBuy < 2 ? 'small' : devBuy < 10 ? 'medium' : 'large';
+  if (!brain.devBuyStats[bucket]) brain.devBuyStats[bucket] = { trades: 0, wins: 0, pnl: 0 };
+  brain.devBuyStats[bucket].trades++;
+  if (pnlSOL > 0) brain.devBuyStats[bucket].wins++;
+  brain.devBuyStats[bucket].pnl += pnlSOL;
+
+  saveBrain();
+  adapt();
+}
+
+const brain = loadBrain();
 
 const state = {
   wallet: null,
   connection: null,
   solBalance: 0,
   positions: {},
-  pendingTokens: {},
+  pending: {},
   trades: [],
   totalSpent: 0,
   startTime: Date.now(),
   running: true,
 };
 
-function log(msg, level = 'INFO') {
-  const ts = new Date().toISOString();
-  const emoji = { INFO: '•', WARN: '⚠', ERROR: '✗', TRADE: '◆' }[level] || '•';
-  const line = `[${ts}] ${emoji} ${msg}`;
-  console.log(line);
-  fs.appendFileSync('./sniper.log', line + '\n');
-}
-
-function saveTrades() {
-  fs.writeFileSync(CONFIG.LOG_FILE, JSON.stringify({
-    startTime: state.startTime,
-    solBalance: state.solBalance,
-    totalSpent: state.totalSpent,
-    trades: state.trades,
-    openPositions: state.positions,
-  }, null, 2));
-}
+const CONFIG = {
+  RPC_URL: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
+  MAX_POSITIONS: 6,
+  MAX_TOTAL_SOL: 0.55,
+  PUMPFUN_WS: 'wss://pumpportal.fun/api/data',
+  SOL_MINT: 'So11111111111111111111111111111111111111112',
+  RUNTIME_MS: 24 * 60 * 60 * 1000,
+};
 
 function loadWallet() {
-  if (!process.env.PRIVATE_KEY) throw new Error('PRIVATE_KEY missing from .env');
+  if (!process.env.PRIVATE_KEY) throw new Error('PRIVATE_KEY missing');
   return Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY));
 }
 
 async function updateBalance() {
-  const lamports = await state.connection.getBalance(state.wallet.publicKey);
-  state.solBalance = lamports / 1e9;
+  const lamps = await state.connection.getBalance(state.wallet.publicKey);
+  state.solBalance = lamps / 1e9;
   return state.solBalance;
 }
 
-async function jupiterSwap(inputMint, outputMint, amountLamports) {
-  const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=${CONFIG.SLIPPAGE_BPS}`;
-  const quoteRes = await fetch(quoteUrl);
-  const quote = await quoteRes.json();
-  if (quote.error) throw new Error(`Quote error: ${quote.error}`);
+async function swap(inMint, outMint, lamports) {
+  const slippage = brain.streak >= 3 ? 1500 : 2500;
+  const q = await (await fetch(
+    `https://quote-api.jup.ag/v6/quote?inputMint=${inMint}&outputMint=${outMint}&amount=${lamports}&slippageBps=${slippage}`
+  )).json();
+  if (q.error) throw new Error(q.error);
 
-  const swapRes = await fetch('https://quote-api.jup.ag/v6/swap', {
+  const s = await (await fetch('https://quote-api.jup.ag/v6/swap', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      quoteResponse: quote,
+      quoteResponse: q,
       userPublicKey: state.wallet.publicKey.toString(),
       wrapAndUnwrapSol: true,
       dynamicComputeUnitLimit: true,
       prioritizationFeeLamports: 'auto',
     }),
-  });
-  const swapData = await swapRes.json();
-  if (!swapData.swapTransaction) throw new Error('No swap transaction');
+  })).json();
+  if (!s.swapTransaction) throw new Error('No swap tx');
 
-  const tx = VersionedTransaction.deserialize(Buffer.from(swapData.swapTransaction, 'base64'));
+  const tx = VersionedTransaction.deserialize(Buffer.from(s.swapTransaction, 'base64'));
   tx.sign([state.wallet]);
-  const sig = await state.connection.sendRawTransaction(tx.serialize(), {
-    skipPreflight: false,
-    maxRetries: 3,
-  });
+  const sig = await state.connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
   await state.connection.confirmTransaction(sig, 'confirmed');
-  return { sig, quote };
+  return { sig, outAmount: parseInt(q.outAmount), inAmount: parseInt(q.inAmount) };
 }
 
-async function getTokenPriceInSOL(mint) {
+async function getPrice(mint) {
   try {
-    const url = `https://price.jup.ag/v6/price?ids=${mint}&vsToken=${CONFIG.SOL_MINT}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    return data?.data?.[mint]?.price || null;
-  } catch {
-    return null;
-  }
+    const d = await (await fetch(`https://price.jup.ag/v6/price?ids=${mint}&vsToken=${CONFIG.SOL_MINT}`)).json();
+    return d?.data?.[mint]?.price || null;
+  } catch { return null; }
 }
 
-async function snipeToken(mint, symbol, initialBuySOL) {
+async function snipe(mint, symbol, devBuy) {
   if (state.positions[mint]) return;
-  if (Object.keys(state.positions).length >= CONFIG.MAX_CONCURRENT_POSITIONS) {
-    log(`Max positions reached, skipping ${symbol}`);
-    return;
-  }
-  if (state.totalSpent + CONFIG.SOL_PER_SNIPE > CONFIG.MAX_TOTAL_SPENT_SOL) {
-    log(`Max total spend reached, skipping ${symbol}`);
-    return;
-  }
+  if (Object.keys(state.positions).length >= CONFIG.MAX_POSITIONS) return;
+  if (state.totalSpent >= CONFIG.MAX_TOTAL_SOL) { log(`⚠ Spend cap hit`); return; }
 
-  const lamports = Math.floor(CONFIG.SOL_PER_SNIPE * 1e9);
+  const pctOfBalance = 0.08;
+  const size = Math.max(0.02, Math.min(brain.solPerSnipe, state.solBalance * pctOfBalance));
+  const lamports = Math.floor(size * 1e9);
 
   try {
-    log(`🎯 SNIPING ${symbol} (${mint.slice(0, 8)}...) | Initial buy: ${initialBuySOL.toFixed(3)} SOL`, 'TRADE');
-    const { sig, quote } = await jupiterSwap(CONFIG.SOL_MINT, mint, lamports);
-
-    const outAmount = parseInt(quote.outAmount);
-    const entryPrice = CONFIG.SOL_PER_SNIPE / (outAmount / 1e6);
+    log(`🎯 SNIPE ${symbol} | Dev: ${devBuy.toFixed(3)} SOL | Size: ${size.toFixed(3)} SOL | TP: ${(brain.takeProfit * 100).toFixed(0)}% | SL: ${(brain.stopLoss * 100).toFixed(0)}%`);
+    const { sig, outAmount } = await swap(CONFIG.SOL_MINT, mint, lamports);
+    const entryPrice = size / (outAmount / 1e6);
 
     state.positions[mint] = {
       symbol, mint, entryPrice,
       amount: outAmount,
       entryTime: Date.now(),
-      solSpent: CONFIG.SOL_PER_SNIPE,
+      solSpent: size,
+      devBuy,
+      tp: brain.takeProfit,
+      sl: brain.stopLoss,
+      maxHold: brain.maxHoldSec,
     };
 
-    state.totalSpent += CONFIG.SOL_PER_SNIPE;
+    state.totalSpent += size;
     await updateBalance();
-
-    state.trades.push({
-      type: 'BUY', symbol, mint,
-      solSpent: CONFIG.SOL_PER_SNIPE,
-      tokensReceived: outAmount,
-      sig, time: new Date().toISOString(),
-    });
-
-    saveTrades();
-    log(`✔ BUY ${symbol} | ${CONFIG.SOL_PER_SNIPE} SOL | tx: ${sig}`, 'TRADE');
+    state.trades.push({ type: 'BUY', symbol, mint, solSpent: size, sig, time: new Date().toISOString() });
+    log(`✔ BUY ${symbol} | tx: ${sig}`);
 
     setTimeout(() => {
-      if (state.positions[mint]) {
-        log(`⏰ Force exit ${symbol} — max hold time reached`);
-        exitPosition(mint, 'TIMEOUT');
-      }
-    }, CONFIG.MAX_HOLD_SECONDS * 1000);
+      if (state.positions[mint]) exitPos(mint, 'TIMEOUT');
+    }, state.positions[mint].maxHold * 1000);
 
   } catch (e) {
-    log(`Snipe failed for ${symbol}: ${e.message}`, 'ERROR');
+    log(`✗ Snipe failed ${symbol}: ${e.message}`);
   }
 }
 
-async function exitPosition(mint, reason) {
+async function exitPos(mint, reason) {
   const pos = state.positions[mint];
   if (!pos) return;
-
   try {
-    log(`📤 EXITING ${pos.symbol} | reason: ${reason}`, 'TRADE');
-    const { sig, quote } = await jupiterSwap(mint, CONFIG.SOL_MINT, pos.amount);
-    const solReceived = parseInt(quote.outAmount) / 1e9;
-    const pnl = solReceived - pos.solSpent;
-    const pct = ((pnl / pos.solSpent) * 100).toFixed(1);
+    const { sig, outAmount } = await swap(mint, CONFIG.SOL_MINT, pos.amount);
+    const solOut = outAmount / 1e9;
+    const pnl = solOut - pos.solSpent;
+    const pct = (pnl / pos.solSpent) * 100;
+    const holdTime = (Date.now() - pos.entryTime) / 1000;
 
-    state.trades.push({
-      type: 'SELL', symbol: pos.symbol, mint,
-      solReceived, pnlSOL: pnl,
-      pnlPct: parseFloat(pct),
-      reason, sig, time: new Date().toISOString(),
-    });
-
+    state.trades.push({ type: 'SELL', symbol: pos.symbol, mint, solOut, pnl, pct, reason, sig, time: new Date().toISOString() });
     delete state.positions[mint];
     await updateBalance();
-    saveTrades();
+    recordTrade(pnl, pct, holdTime, pos.devBuy, reason);
 
-    const emoji = pnl > 0 ? '🟢' : '🔴';
-    log(`${emoji} SELL ${pos.symbol} | ${pnl > 0 ? '+' : ''}${pnl.toFixed(4)} SOL (${pct}%) | tx: ${sig}`, 'TRADE');
+    const e = pnl > 0 ? '🟢' : '🔴';
+    log(`${e} ${pos.symbol} | ${pnl > 0 ? '+' : ''}${pnl.toFixed(4)} SOL (${pct.toFixed(1)}%) | ${holdTime.toFixed(0)}s | ${reason}`);
+    log(`🧠 ${brain.wins}W/${brain.losses}L | PnL: ${brain.totalPnlSOL > 0 ? '+' : ''}${brain.totalPnlSOL.toFixed(4)} SOL | Streak: ${brain.streak} | Balance: ${state.solBalance.toFixed(4)} SOL`);
+    saveState();
   } catch (e) {
-    log(`Exit failed for ${pos.symbol}: ${e.message}`, 'ERROR');
+    log(`✗ Exit failed ${pos.symbol}: ${e.message}`);
   }
 }
 
-async function monitorPositions() {
+function saveState() {
+  fs.writeFileSync('./trades.json', JSON.stringify({ trades: state.trades, brain }, null, 2));
+}
+
+async function monitor() {
   while (state.running) {
     for (const [mint, pos] of Object.entries(state.positions)) {
       try {
-        const price = await getTokenPriceInSOL(mint);
+        const price = await getPrice(mint);
         if (!price) continue;
         const pnl = (price - pos.entryPrice) / pos.entryPrice;
-        if (pnl >= CONFIG.TAKE_PROFIT_PCT) {
-          log(`🚀 ${pos.symbol} hit take profit: +${(pnl * 100).toFixed(1)}%`);
-          await exitPosition(mint, 'TAKE_PROFIT');
-        } else if (pnl <= -CONFIG.STOP_LOSS_PCT) {
-          log(`💀 ${pos.symbol} hit stop loss: ${(pnl * 100).toFixed(1)}%`);
-          await exitPosition(mint, 'STOP_LOSS');
-        }
-      } catch (e) {}
-    }
-    await sleep(10000);
-  }
-}
-
-function connectPumpFun() {
-  log(`Connecting to pump.fun WebSocket...`);
-  const ws = new WebSocket(CONFIG.PUMPFUN_WS);
-
-  ws.on('open', () => {
-    log('✔ Connected to pump.fun stream');
-    ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
-    ws.send(JSON.stringify({ method: 'subscribeTokenTrade' }));
-    log('Subscribed to: new token launches + trade stream');
-  });
-
-  ws.on('message', async (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString());
-      await handlePumpMessage(msg);
-    } catch (e) {}
-  });
-
-  ws.on('close', () => {
-    log('WebSocket disconnected. Reconnecting in 5s...', 'WARN');
-    setTimeout(connectPumpFun, 5000);
-  });
-
-  ws.on('error', (e) => {
-    log(`WebSocket error: ${e.message}`, 'ERROR');
-  });
-
-  return ws;
-}
-
-async function handlePumpMessage(msg) {
-  if (msg.txType === 'create') {
-    const { mint, name, symbol, solAmount } = msg;
-    if (!mint || !symbol) return;
-    log(`🆕 New token: ${symbol} (${name}) | Dev buy: ${(solAmount || 0).toFixed(3)} SOL`);
-    state.pendingTokens[mint] = {
-      symbol, name, mint,
-      firstSeenTime: Date.now(),
-      initialBuySOL: solAmount || 0,
-      buyers: [],
-      volume: solAmount || 0,
-    };
-    if ((solAmount || 0) < CONFIG.MIN_INITIAL_BUY_SOL) {
-      log(`⏭ Skipping ${symbol} — dev buy too small`);
-      delete state.pendingTokens[mint];
-    }
-  }
-
-  if (msg.txType === 'buy') {
-    const { mint, traderPublicKey, solAmount } = msg;
-    if (!mint) return;
-    const pending = state.pendingTokens[mint];
-    if (pending) {
-      if (!pending.buyers.includes(traderPublicKey)) {
-        pending.buyers.push(traderPublicKey);
-        pending.volume += solAmount || 0;
-      }
-      const ageMs = Date.now() - pending.firstSeenTime;
-      const uniqueBuyers = pending.buyers.length;
-      if (
-        uniqueBuyers >= CONFIG.MIN_UNIQUE_BUYERS_TO_CONFIRM &&
-        ageMs < CONFIG.CONFIRM_WINDOW_MS &&
-        !state.positions[mint]
-      ) {
-        log(`📈 ${pending.symbol} momentum confirmed: ${uniqueBuyers} buyers in ${(ageMs / 1000).toFixed(1)}s`);
-        delete state.pendingTokens[mint];
-        await snipeToken(mint, pending.symbol, pending.initialBuySOL);
-      }
-      if (ageMs > CONFIG.CONFIRM_WINDOW_MS) {
-        delete state.pendingTokens[mint];
-      }
-    }
-  }
-}
-
-function cleanupPending() {
-  const now = Date.now();
-  for (const [mint, token] of Object.entries(state.pendingTokens)) {
-    if (now - token.firstSeenTime > CONFIG.CONFIRM_WINDOW_MS * 2) {
-      delete state.pendingTokens[mint];
-    }
-  }
-}
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
-
-function printStats() {
-  const sells = state.trades.filter(t => t.type === 'SELL');
-  const totalPnl = sells.reduce((sum, t) => sum + (t.pnlSOL || 0), 0);
-  const wins = sells.filter(t => t.pnlSOL > 0).length;
-  const runtime = ((Date.now() - state.startTime) / 1000 / 60).toFixed(1);
-  log(`─── STATS | ${runtime}m | Balance: ${state.solBalance.toFixed(4)} SOL | PnL: ${totalPnl > 0 ? '+' : ''}${totalPnl.toFixed(4)} SOL | Trades: ${sells.length} | Win rate: ${sells.length ? ((wins / sells.length) * 100).toFixed(0) : 0}%`);
-}
-
-async function main() {
-  console.log(`
-╔═══════════════════════════════════════════╗
-║      PUMP.FUN SNIPER BOT  🎯              ║
-║      Strategy: New launch momentum        ║
-╚═══════════════════════════════════════════╝
-  `);
-
-  state.wallet = loadWallet();
-  state.connection = new Connection(CONFIG.RPC_URL, 'confirmed');
-  log(`Wallet: ${state.wallet.publicKey.toString()}`);
-  await updateBalance();
-  log(`SOL balance: ${state.solBalance.toFixed(4)} SOL`);
-
-  if (state.solBalance < 0.1) {
-    log('Low balance warning — need at least 0.1 SOL', 'WARN');
-  }
-
-  const endTime = state.startTime + CONFIG.RUNTIME_MS;
-  log(`Running until: ${new Date(endTime).toISOString()}`);
-
-  connectPumpFun();
-  monitorPositions();
-  setInterval(printStats, 5 * 60 * 1000);
-  setInterval(cleanupPending, 30000);
-
-  setTimeout(async () => {
-    log('24 hours complete — closing all positions...');
-    state.running = false;
-    for (const mint of Object.keys(state.positions)) {
-      await exitPosition(mint, 'END_OF_RUN');
-    }
-    await updateBalance();
-    printStats();
-    saveTrades();
-    process.exit(0);
-  }, CONFIG.RUNTIME_MS);
-}
-
-process.on('SIGINT', async () => {
-  log('Shutting down...');
-  state.running = false;
-  for (const mint of Object.keys(state.positions)) {
-    await exitPosition(mint, 'MANUAL_STOP');
-  }
-  printStats();
-  saveTrades();
-  process.exit(0);
-});
-
-main().catch(e => {
-  log(`Fatal: ${e.message}`, 'ERROR');
-  process.exit(1);
-});
+        if (pnl >= pos.tp) {
+          log(`🚀 ${pos.symbol} TP hit: +${(pnl * 100).toFixed(1)}%`);
+          await exitPos(mint, '​​​​​​​​​​​​​​​​
