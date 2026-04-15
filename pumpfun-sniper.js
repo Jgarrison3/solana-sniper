@@ -281,4 +281,121 @@ async function monitor() {
         const pnl = (price - pos.entryPrice) / pos.entryPrice;
         if (pnl >= pos.tp) {
           log(`🚀 ${pos.symbol} TP hit: +${(pnl * 100).toFixed(1)}%`);
-          await exitPos(mint, '​​​​​​​​​​​​​​​​
+          await exitPos(mint, 'TAKE_PROFIT');
+        } else if (pnl <= -pos.sl) {
+          log(`💀 ${pos.symbol} SL hit: ${(pnl * 100).toFixed(1)}%`);
+          await exitPos(mint, 'STOP_LOSS');
+        }
+      } catch (e) {}
+    }
+    await new Promise(r => setTimeout(r, 8000));
+  }
+}
+
+function connect() {
+  const ws = new WebSocket(CONFIG.PUMPFUN_WS);
+
+  ws.on('open', () => {
+    log('✔ Connected to pump.fun');
+    ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+    ws.send(JSON.stringify({ method: 'subscribeTokenTrade' }));
+  });
+
+  ws.on('message', async (raw) => {
+    try { await handle(JSON.parse(raw.toString())); } catch (e) {}
+  });
+
+  ws.on('close', () => { log('⚠ WS closed, reconnecting...'); setTimeout(connect, 3000); });
+  ws.on('error', (e) => log(`✗ WS error: ${e.message}`));
+}
+
+async function handle(msg) {
+  if (msg.txType === 'create') {
+    const { mint, symbol, name, solAmount } = msg;
+    if (!mint || !symbol) return;
+    if ((solAmount || 0) < brain.minDevBuy) return;
+
+    log(`🆕 ${symbol} | Dev: ${(solAmount || 0).toFixed(3)} SOL`);
+    state.pending[mint] = {
+      symbol, name, mint,
+      firstSeen: Date.now(),
+      devBuy: solAmount || 0,
+      buyers: new Set(),
+      volume: solAmount || 0,
+    };
+  }
+
+  if (msg.txType === 'buy') {
+    const { mint, traderPublicKey, solAmount } = msg;
+    if (!mint || !state.pending[mint]) return;
+
+    const p = state.pending[mint];
+    p.buyers.add(traderPublicKey);
+    p.volume += solAmount || 0;
+
+    const age = Date.now() - p.firstSeen;
+    if (p.buyers.size >= brain.minBuyers && age < brain.confirmWindowMs && !state.positions[mint]) {
+      log(`📈 ${p.symbol} — ${p.buyers.size} buyers, ${p.volume.toFixed(3)} SOL in ${(age / 1000).toFixed(1)}s`);
+      delete state.pending[mint];
+      await snipe(mint, p.symbol, p.devBuy);
+    } else if (age > brain.confirmWindowMs) {
+      delete state.pending[mint];
+    }
+  }
+}
+
+async function main() {
+  console.log(`
+╔══════════════════════════════════════════════════╗
+║   PUMP.FUN MAX PROFIT SNIPER v3  🧠🎯💰          ║
+║   Goal: Maximum SOL in 24 hours                  ║
+║   Engine: Adaptive learning brain                ║
+╚══════════════════════════════════════════════════╝
+  `);
+
+  state.wallet = loadWallet();
+  state.connection = new Connection(CONFIG.RPC_URL, 'confirmed');
+  log(`Wallet: ${state.wallet.publicKey.toString()}`);
+  await updateBalance();
+  brain.startingBalance = state.solBalance;
+  log(`Starting balance: ${state.solBalance.toFixed(4)} SOL`);
+  log(`Strategy: TP ${(brain.takeProfit * 100).toFixed(0)}% | SL ${(brain.stopLoss * 100).toFixed(0)}% | ${brain.solPerSnipe.toFixed(3)} SOL/trade | ${brain.minBuyers} buyers | ${brain.minDevBuy} SOL min dev buy`);
+  log(`Running until: ${new Date(Date.now() + CONFIG.RUNTIME_MS).toISOString()}`);
+
+  connect();
+  monitor();
+
+  setInterval(() => {
+    const wr = brain.totalTrades > 0 ? ((brain.wins / brain.totalTrades) * 100).toFixed(0) : 0;
+    log(`━ ${brain.wins}W/${brain.losses}L (${wr}%) | PnL: ${brain.totalPnlSOL > 0 ? '+' : ''}${brain.totalPnlSOL.toFixed(4)} SOL | Bal: ${state.solBalance.toFixed(4)} SOL | Streak: ${brain.streak} | TP: ${(brain.takeProfit * 100).toFixed(0)}% SL: ${(brain.stopLoss * 100).toFixed(0)}%`);
+  }, 3 * 60 * 1000);
+
+  setInterval(() => {
+    const now = Date.now();
+    for (const [mint, p] of Object.entries(state.pending)) {
+      if (now - p.firstSeen > brain.confirmWindowMs * 2) delete state.pending[mint];
+    }
+  }, 20000);
+
+  setTimeout(async () => {
+    log('⏰ 24h complete — closing all positions');
+    state.running = false;
+    for (const mint of Object.keys(state.positions)) await exitPos(mint, 'END_OF_RUN');
+    await updateBalance();
+    const profit = state.solBalance - brain.startingBalance;
+    log(`🏁 FINAL: ${state.solBalance.toFixed(4)} SOL | ${profit > 0 ? '+' : ''}${profit.toFixed(4)} SOL profit | ${brain.wins}W/${brain.losses}L`);
+    saveState();
+    process.exit(0);
+  }, CONFIG.RUNTIME_MS);
+}
+
+process.on('SIGINT', async () => {
+  state.running = false;
+  for (const mint of Object.keys(state.positions)) await exitPos(mint, 'MANUAL_STOP');
+  const profit = state.solBalance - brain.startingBalance;
+  log(`🏁 Stopped: ${state.solBalance.toFixed(4)} SOL | ${profit > 0 ? '+' : ''}${profit.toFixed(4)} SOL`);
+  saveState();
+  process.exit(0);
+});
+
+main().catch(e => { log(`Fatal: ${e.message}`); process.exit(1); });
