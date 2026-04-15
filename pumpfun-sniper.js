@@ -21,7 +21,7 @@ require('dotenv').config();
 const { Connection, Keypair, VersionedTransaction, PublicKey } = require('@solana/web3.js');
 const fetch = require('node-fetch');
 const WebSocket = require('ws');
-const bs58 = require('bs58');
+const bs58 = require('bs58').default || require('bs58');
 const fs = require('fs');
 
 // ─── CONFIG ────────────────────────────────────────────────────
