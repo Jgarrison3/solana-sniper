@@ -165,7 +165,7 @@ async function swap(isBuy, mint, lamports) {
     amount: lamports,
     denominatedInSol: isBuy ? 'true' : 'false',
     slippage: 25,
-    priorityFee: 0.001,
+    priorityFee: 0.005,
     pool: 'pump'
   };
 
