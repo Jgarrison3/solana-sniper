@@ -172,6 +172,41 @@ async function updateBalance() {
 }
 
 async function swap(inMint, outMint, lamports) {
+  const isBuy = inMint === CONFIG.SOL_MINT;
+  const mint = isBuy ? outMint : inMint;
+  
+  const url = `https://pumpportal.fun/api/trade-local`;
+  const body = {
+    publicKey: state.wallet.publicKey.toString(),
+    action: isBuy ? 'buy' : 'sell',
+    mint,
+    amount: lamports,
+    denominatedInSol: isBuy ? 'true' : 'false',
+    slippage: 25,
+    priorityFee: 0.001,
+    pool: 'pump'
+  };
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (res.status !== 200) throw new Error(`PumpPortal API error: ${res.status}`);
+  
+  const data = await res.arrayBuffer();
+  const tx = VersionedTransaction.deserialize(new Uint8Array(data));
+  tx.sign([state.wallet]);
+  
+  const sig = await state.connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+    maxRetries: 3,
+  });
+  await state.connection.confirmTransaction(sig, 'confirmed');
+  return { sig, outAmount: lamports, inAmount: lamports };
+}
+
   const slippage = brain.streak >= 3 ? 1500 : 2500;
   const q = await (await fetch(
     `https://quote-api.jup.ag/v6/quote?inputMint=${inMint}&outputMint=${outMint}&amount=${lamports}&slippageBps=${slippage}`
