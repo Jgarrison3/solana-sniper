@@ -313,36 +313,17 @@ async function handle(msg) {
   if (msg.txType === 'create') {
     const { mint, symbol, name, solAmount } = msg;
     if (!mint || !symbol) return;
-    if ((solAmount || 0) < brain.minDevBuy) return;
-
-    log(`🆕 ${symbol} | Dev: ${(solAmount || 0).toFixed(3)} SOL`);
-    state.pending[mint] = {
-      symbol, name, mint,
-      firstSeen: Date.now(),
-      devBuy: solAmount || 0,
-      buyers: new Set(),
-      volume: solAmount || 0,
-    };
-  }
-
-  if (msg.txType === 'buy') {
-    const { mint, traderPublicKey, solAmount } = msg;
-    if (!mint || !state.pending[mint]) return;
-
-    const p = state.pending[mint];
-    p.buyers.add(traderPublicKey);
-    p.volume += solAmount || 0;
-
-    const age = Date.now() - p.firstSeen;
-    if (p.buyers.size >= brain.minBuyers && age < brain.confirmWindowMs && !state.positions[mint]) {
-      log(`📈 ${p.symbol} — ${p.buyers.size} buyers, ${p.volume.toFixed(3)} SOL in ${(age / 1000).toFixed(1)}s`);
-      delete state.pending[mint];
-      await snipe(mint, p.symbol, p.devBuy);
-    } else if (age > brain.confirmWindowMs) {
-      delete state.pending[mint];
+    const devBuy = solAmount || 0;
+    log(`🆕 ${symbol} | Dev: ${devBuy.toFixed(3)} SOL`);
+    if (devBuy < brain.minDevBuy) {
+      log(`⏭ Skipping ${symbol} — dev buy too small`);
+      return;
     }
+    log(`📈 ${symbol} — sniping on launch!`);
+    await snipe(mint, symbol, devBuy);
   }
 }
+
 
 async function main() {
   console.log(`
