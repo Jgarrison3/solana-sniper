@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Connection, Keypair, VersionedTransaction } = require('@solana/web3.js');
+const { Connection, Keypair, VersionedTransaction, PublicKey } = require('@solana/web3.js');
 const fetch = require('node-fetch');
 const bs58 = require('bs58').default || require('bs58');
 const fs = require('fs');
@@ -29,11 +29,10 @@ function loadBrain() {
     avgWinPct: 0,
     avgLossPct: 0,
     avgHoldTimeWin: 0,
-    takeProfit: 1.00,
-    stopLoss: 0.30,
+    takeProfit: 0.50,
+    stopLoss: 0.20,
     maxHoldSec: 300,
-    solPerSnipe: 0.05,
-    minMomentumPct: 5,
+    solPerTrade: 0.05,
     streak: 0,
     bestStreak: 0,
     recentTrades: [],
@@ -51,46 +50,35 @@ function adapt() {
 
   const recent = recentTrades.slice(-6);
   const recentWinRate = recent.length > 0 ? recent.filter(function(t) { return t.pnl > 0; }).length / recent.length : 0.5;
-
   const balanceGrowth = state.solBalance / (brain.startingBalance || state.solBalance);
-  if (balanceGrowth > 1.5) {
-    brain.solPerSnipe = Math.min(0.20, brain.solPerSnipe * 1.15);
-    log('Brain: Balance up - scaling to ' + brain.solPerSnipe.toFixed(3) + ' SOL/trade');
-  } else if (balanceGrowth < 0.7) {
-    brain.solPerSnipe = Math.max(0.02, brain.solPerSnipe * 0.85);
-    log('Brain: Balance down - scaling back to ' + brain.solPerSnipe.toFixed(3) + ' SOL/trade');
+
+  if (balanceGrowth > 1.3) {
+    brain.solPerTrade = Math.min(0.15, brain.solPerTrade * 1.1);
+    log('Brain: Scaling up to ' + brain.solPerTrade.toFixed(3) + ' SOL/trade');
+  } else if (balanceGrowth < 0.8) {
+    brain.solPerTrade = Math.max(0.02, brain.solPerTrade * 0.85);
+    log('Brain: Scaling down to ' + brain.solPerTrade.toFixed(3) + ' SOL/trade');
   }
 
   if (streak >= 3) {
-    brain.takeProfit = Math.min(3.0, brain.takeProfit * 1.2);
-    log('Brain: Hot streak - raising TP to ' + (brain.takeProfit * 100).toFixed(0) + '%');
+    brain.takeProfit = Math.min(2.0, brain.takeProfit * 1.15);
+    log('Brain: Hot streak - TP now ' + (brain.takeProfit * 100).toFixed(0) + '%');
   } else if (recentWinRate < 0.3) {
-    brain.takeProfit = Math.max(0.50, brain.takeProfit * 0.9);
-    log('Brain: Cold - lowering TP to ' + (brain.takeProfit * 100).toFixed(0) + '%');
+    brain.takeProfit = Math.max(0.30, brain.takeProfit * 0.9);
+    log('Brain: Lowering TP to ' + (brain.takeProfit * 100).toFixed(0) + '%');
   }
 
   if (streak <= -3) {
-    brain.stopLoss = Math.max(0.15, brain.stopLoss * 0.85);
-    log('Brain: Loss streak - tightening SL to ' + (brain.stopLoss * 100).toFixed(0) + '%');
-  } else if (streak >= 3) {
-    brain.stopLoss = Math.min(0.45, brain.stopLoss * 1.1);
-  }
-
-  if (recentWinRate < 0.25 && totalTrades >= 5) {
-    brain.minMomentumPct = Math.min(30, brain.minMomentumPct + 2);
-    log('Brain: Raising momentum threshold to ' + brain.minMomentumPct + '%');
-  } else if (recentWinRate > 0.6 && totalTrades >= 5) {
-    brain.minMomentumPct = Math.max(3, brain.minMomentumPct - 2);
-    log('Brain: Lowering momentum threshold to ' + brain.minMomentumPct + '%');
+    brain.stopLoss = Math.max(0.10, brain.stopLoss * 0.85);
+    log('Brain: Tightening SL to ' + (brain.stopLoss * 100).toFixed(0) + '%');
   }
 
   saveBrain();
 }
 
-function recordTrade(pnlSOL, pnlPct, holdTime, reason) {
-  brain.recentTrades.push({ pnl: pnlSOL, pct: pnlPct, holdTime: holdTime, reason: reason, time: Date.now() });
+function recordTrade(pnlSOL, pnlPct, holdTime, symbol, reason) {
+  brain.recentTrades.push({ pnl: pnlSOL, pct: pnlPct, holdTime: holdTime, symbol: symbol, reason: reason, time: Date.now() });
   if (brain.recentTrades.length > 30) brain.recentTrades.shift();
-
   brain.totalTrades++;
   brain.totalPnlSOL += pnlSOL;
 
@@ -118,6 +106,7 @@ const state = {
   solBalance: 0,
   positions: {},
   trades: [],
+  priceHistory: {},
   recentlyTraded: {},
   totalSpent: 0,
   startTime: Date.now(),
@@ -126,11 +115,24 @@ const state = {
 
 const CONFIG = {
   RPC_URL: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
-  MAX_POSITIONS: 5,
-  MAX_TOTAL_SOL: 0.55,
+  MAX_POSITIONS: 4,
   RUNTIME_MS: 24 * 60 * 60 * 1000,
-  SCAN_INTERVAL_MS: 15000,
+  SCAN_INTERVAL_MS: 20000,
+  SOL_MINT: 'So11111111111111111111111111111111111111112',
+  RAYDIUM_API: 'https://transaction-v1.raydium.io',
 };
+
+// Top Solana meme/trending tokens to watch
+const WATCHLIST = [
+  { symbol: 'WIF',    mint: 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm' },
+  { symbol: 'BONK',   mint: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263' },
+  { symbol: 'POPCAT', mint: '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr' },
+  { symbol: 'MEW',    mint: 'MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5' },
+  { symbol: 'MYRO',   mint: 'HhJpBhRRn4g56VsyLuT8DL5Bv31HkXqsrahTTUCZeZg4' },
+  { symbol: 'BOME',   mint: 'ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82' },
+  { symbol: 'SLERF',  mint: '7BgBvyjrZX1YKz4oh9mjb8ZScatkkwb8DzFx7LoiVkM3' },
+  { symbol: 'PONKE',  mint: '5z3EqYQo9HiCEs3R84RCDMu2n7anpDMxRhdK31CR6Ta' },
+];
 
 function loadWallet() {
   if (!process.env.PRIVATE_KEY) throw new Error('PRIVATE_KEY missing');
@@ -143,70 +145,94 @@ async function updateBalance() {
   return state.solBalance;
 }
 
-async function swap(isBuy, mint, lamports) {
-  const body = {
-    publicKey: state.wallet.publicKey.toString(),
-    action: isBuy ? 'buy' : 'sell',
-    mint: mint,
-    amount: lamports,
-    denominatedInSol: isBuy ? 'true' : 'false',
-    slippage: 25,
-    priorityFee: 0.005,
-    pool: 'pump'
-  };
+async function raydiumSwap(inputMint, outputMint, amountLamports) {
+  // Step 1: Get quote from Raydium
+  const quoteUrl = CONFIG.RAYDIUM_API + '/compute/swap-base-in?inputMint=' + inputMint + '&outputMint=' + outputMint + '&amount=' + amountLamports + '&slippageBps=200&txVersion=V0';
+  const quoteRes = await fetch(quoteUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+  if (!quoteRes.ok) throw new Error('Raydium quote error: ' + quoteRes.status);
+  const quote = await quoteRes.json();
+  if (!quote.success) throw new Error('Raydium quote failed: ' + JSON.stringify(quote));
 
-  const res = await fetch('https://pumpportal.fun/api/trade-local', {
+  // Step 2: Get priority fee
+  const feeRes = await fetch(CONFIG.RAYDIUM_API + '/compute/base-fee', { headers: { 'User-Agent': 'Mozilla/5.0' } });
+  const feeData = await feeRes.json();
+  const priorityFee = feeData.data ? feeData.data.default.h : 25000;
+
+  // Step 3: Build transaction
+  const txRes = await fetch(CONFIG.RAYDIUM_API + '/transaction/swap-base-in', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+    body: JSON.stringify({
+      computeUnitPriceMicroLamports: String(priorityFee),
+      swapResponse: quote,
+      txVersion: 'V0',
+      wallet: state.wallet.publicKey.toBase58(),
+      wrapSol: inputMint === CONFIG.SOL_MINT,
+      unwrapSol: outputMint === CONFIG.SOL_MINT,
+    }),
   });
+  if (!txRes.ok) throw new Error('Raydium tx build error: ' + txRes.status);
+  const txData = await txRes.json();
+  if (!txData.success || !txData.data) throw new Error('Raydium tx build failed');
 
-  if (res.status !== 200) throw new Error('PumpPortal error: ' + res.status);
-
-  const data = await res.arrayBuffer();
-  const tx = VersionedTransaction.deserialize(new Uint8Array(data));
+  // Step 4: Sign and send
+  const txBuf = Buffer.from(txData.data[0].transaction, 'base64');
+  const tx = VersionedTransaction.deserialize(txBuf);
   tx.sign([state.wallet]);
-
-  const sig = await state.connection.sendRawTransaction(tx.serialize(), {
-    skipPreflight: false,
-    maxRetries: 3,
-  });
+  const sig = await state.connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
   await state.connection.confirmTransaction(sig, 'confirmed');
-  return sig;
+  return { sig, outAmount: parseInt(quote.data.outputAmount) };
 }
 
-async function buy(mint, symbol, priceChange) {
+async function getPrice(mint) {
+  try {
+    const url = 'https://api.dexscreener.com/latest/dex/tokens/' + mint;
+    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (!data.pairs || data.pairs.length === 0) return null;
+    const pair = data.pairs.sort(function(a, b) { return (b.liquidity ? b.liquidity.usd : 0) - (a.liquidity ? a.liquidity.usd : 0); })[0];
+    return {
+      price: parseFloat(pair.priceUsd || 0),
+      priceChange5m: pair.priceChange ? (pair.priceChange.m5 || 0) : 0,
+      priceChange1h: pair.priceChange ? (pair.priceChange.h1 || 0) : 0,
+      volume5m: pair.volume ? (pair.volume.m5 || 0) : 0,
+    };
+  } catch (e) { return null; }
+}
+
+async function enterTrade(token, priceData) {
+  const { symbol, mint } = token;
   if (state.positions[mint]) return;
   if (state.recentlyTraded[mint]) return;
   if (Object.keys(state.positions).length >= CONFIG.MAX_POSITIONS) return;
-  if (state.totalSpent >= CONFIG.MAX_TOTAL_SOL) { log('Spend cap hit'); return; }
 
-  const size = Math.max(0.02, Math.min(brain.solPerSnipe, state.solBalance * 0.08));
+  const size = Math.max(0.02, Math.min(brain.solPerTrade, state.solBalance * 0.10));
   const lamports = Math.floor(size * 1e9);
 
   try {
-    log('BUY ' + symbol + ' | 5m change: +' + priceChange.toFixed(1) + '% | Size: ' + size.toFixed(3) + ' SOL | TP: ' + (brain.takeProfit * 100).toFixed(0) + '% | SL: ' + (brain.stopLoss * 100).toFixed(0) + '%');
-    const sig = await swap(true, mint, lamports);
+    log('BUY ' + symbol + ' | 5m: +' + priceData.priceChange5m.toFixed(1) + '% | 1h: ' + priceData.priceChange1h.toFixed(1) + '% | Size: ' + size.toFixed(3) + ' SOL');
+    const { sig, outAmount } = await raydiumSwap(CONFIG.SOL_MINT, mint, lamports);
 
     state.positions[mint] = {
       symbol: symbol,
       mint: mint,
       entryTime: Date.now(),
+      entryPrice: priceData.price,
       solSpent: size,
+      tokenAmount: outAmount,
       tp: brain.takeProfit,
       sl: brain.stopLoss,
       maxHold: brain.maxHoldSec,
-      amount: lamports,
-      entryPriceChange: priceChange,
     };
 
     state.totalSpent += size;
     await updateBalance();
-    state.trades.push({ type: 'BUY', symbol: symbol, mint: mint, solSpent: size, sig: sig, time: new Date().toISOString() });
-    log('BUY confirmed ' + symbol + ' | tx: ' + sig + ' | Bal: ' + state.solBalance.toFixed(4) + ' SOL');
+    state.trades.push({ type: 'BUY', symbol: symbol, mint: mint, solSpent: size, entryPrice: priceData.price, sig: sig, time: new Date().toISOString() });
+    log('BUY confirmed ' + symbol + ' @ $' + priceData.price.toFixed(6) + ' | tx: ' + sig + ' | Bal: ' + state.solBalance.toFixed(4) + ' SOL');
 
     setTimeout(function() {
-      if (state.positions[mint]) exitPos(mint, 'TIMEOUT');
+      if (state.positions[mint]) exitTrade(mint, 'TIMEOUT');
     }, brain.maxHoldSec * 1000);
 
   } catch (e) {
@@ -214,106 +240,76 @@ async function buy(mint, symbol, priceChange) {
   }
 }
 
-async function exitPos(mint, reason) {
+async function exitTrade(mint, reason) {
   const pos = state.positions[mint];
   if (!pos) return;
   try {
-    log('SELLING ' + pos.symbol + ' | reason: ' + reason);
-    const sig = await swap(false, mint, pos.amount);
+    log('SELL ' + pos.symbol + ' | reason: ' + reason);
+    const { sig } = await raydiumSwap(mint, CONFIG.SOL_MINT, pos.tokenAmount);
     const holdTime = (Date.now() - pos.entryTime) / 1000;
-
+    const prevBal = state.solBalance;
     await updateBalance();
-    const pnl = state.solBalance - (brain.startingBalance - state.totalSpent + pos.solSpent);
+    const pnl = state.solBalance - prevBal + pos.solSpent;
     const pct = (pnl / pos.solSpent) * 100;
 
-    state.trades.push({ type: 'SELL', symbol: pos.symbol, mint: mint, reason: reason, sig: sig, time: new Date().toISOString() });
+    state.trades.push({ type: 'SELL', symbol: pos.symbol, mint: mint, pnl: pnl, pct: pct, reason: reason, sig: sig, time: new Date().toISOString() });
     delete state.positions[mint];
     state.recentlyTraded[mint] = Date.now();
-    recordTrade(pnl, pct, holdTime, reason);
+    recordTrade(pnl, pct, holdTime, pos.symbol, reason);
 
     const result = pnl > 0 ? 'WIN' : 'LOSS';
     log(result + ' ' + pos.symbol + ' | ' + (pnl > 0 ? '+' : '') + pnl.toFixed(4) + ' SOL (' + pct.toFixed(1) + '%) | ' + holdTime.toFixed(0) + 's | ' + reason);
-    log('Brain: ' + brain.wins + 'W/' + brain.losses + 'L | PnL: ' + brain.totalPnlSOL.toFixed(4) + ' SOL | Streak: ' + brain.streak + ' | Bal: ' + state.solBalance.toFixed(4) + ' SOL');
+    log('Brain: ' + brain.wins + 'W/' + brain.losses + 'L | Total PnL: ' + (brain.totalPnlSOL > 0 ? '+' : '') + brain.totalPnlSOL.toFixed(4) + ' SOL | Streak: ' + brain.streak + ' | Bal: ' + state.solBalance.toFixed(4) + ' SOL');
     fs.writeFileSync('./trades.json', JSON.stringify({ trades: state.trades, brain: brain }, null, 2));
   } catch (e) {
-    log('Exit failed ' + pos.symbol + ': ' + e.message);
+    log('Sell failed ' + pos.symbol + ': ' + e.message);
   }
 }
 
-async function scanDexScreener() {
-  try {
-    const url = 'https://api.dexscreener.com/latest/dex/search?q=pump&order=desc&sortBy=volume';
-    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-    if (!res.ok) {
-      log('DexScreener error: ' + res.status);
-      return;
-    }
-    const data = await res.json();
-    const pairs = data.pairs || [];
-
-    let candidates = 0;
-    for (const pair of pairs) {
-      if (!pair.chainId || pair.chainId !== 'solana') continue;
-      if (!pair.baseToken || !pair.baseToken.address) continue;
-
-      const mint = pair.baseToken.address;
-      const symbol = pair.baseToken.symbol || 'UNKNOWN';
-      const priceChange5m = pair.priceChange ? (pair.priceChange.m5 || 0) : 0;
-      const volume5m = pair.volume ? (pair.volume.m5 || 0) : 0;
-      const liquidity = pair.liquidity ? (pair.liquidity.usd || 0) : 0;
-      const pairCreated = pair.pairCreatedAt || 0;
-      const ageMin = pairCreated > 0 ? (Date.now() - pairCreated) / 1000 / 60 : 999;
-
-      if (state.positions[mint] || state.recentlyTraded[mint]) continue;
-      if (ageMin < 1 || ageMin > 120) continue;
-      if (liquidity < 500) continue;
-      if (volume5m < 100) continue;
-
-      candidates++;
-
-      if (priceChange5m >= brain.minMomentumPct) {
-        log('MOMENTUM ' + symbol + ' | 5m: +' + priceChange5m.toFixed(1) + '% | Vol: $' + volume5m.toFixed(0) + ' | Age: ' + ageMin.toFixed(1) + 'min');
-        await buy(mint, symbol, priceChange5m);
-      }
-    }
-
-    log('Scan complete: ' + pairs.length + ' pairs | ' + candidates + ' candidates | ' + Object.keys(state.positions).length + ' positions open');
-
-  } catch (e) {
-    log('Scan error: ' + e.message);
-  }
-}
-
-async function monitorPositions() {
-  for (const mint in state.positions) {
+async function scan() {
+  log('Scanning ' + WATCHLIST.length + ' tokens...');
+  for (const token of WATCHLIST) {
     try {
-      const pos = state.positions[mint];
-      const url = 'https://api.dexscreener.com/latest/dex/tokens/' + mint;
-      const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-      if (!res.ok) continue;
-      const data = await res.json();
-      if (!data.pairs || data.pairs.length === 0) continue;
+      const priceData = await getPrice(token.mint);
+      if (!priceData || !priceData.price) continue;
 
-      const pair = data.pairs[0];
-      const priceChange1h = pair.priceChange ? (pair.priceChange.h1 || 0) : 0;
+      const { symbol, mint } = token;
+      log(symbol + ' | 5m: ' + priceData.priceChange5m.toFixed(1) + '% | 1h: ' + priceData.priceChange1h.toFixed(1) + '% | Vol5m: $' + priceData.volume5m.toFixed(0));
 
-      log('Monitor ' + pos.symbol + ' | 1h change: ' + priceChange1h.toFixed(1) + '% | TP: ' + (pos.tp * 100).toFixed(0) + '% | SL: -' + (pos.sl * 100).toFixed(0) + '%');
-
-      if (priceChange1h >= pos.tp * 100) {
-        log('TP hit ' + pos.symbol + ': +' + priceChange1h.toFixed(1) + '%');
-        await exitPos(mint, 'TAKE_PROFIT');
-      } else if (priceChange1h <= -(pos.sl * 100)) {
-        log('SL hit ' + pos.symbol + ': ' + priceChange1h.toFixed(1) + '%');
-        await exitPos(mint, 'STOP_LOSS');
+      if (state.positions[mint]) {
+        const pos = state.positions[mint];
+        const pnlPct = ((priceData.price - pos.entryPrice) / pos.entryPrice) * 100;
+        if (pnlPct >= pos.tp * 100) {
+          log('TP hit ' + symbol + ': +' + pnlPct.toFixed(1) + '%');
+          await exitTrade(mint, 'TAKE_PROFIT');
+        } else if (pnlPct <= -(pos.sl * 100)) {
+          log('SL hit ' + symbol + ': ' + pnlPct.toFixed(1) + '%');
+          await exitTrade(mint, 'STOP_LOSS');
+        }
+        continue;
       }
-    } catch (e) {}
+
+      if (state.recentlyTraded[mint]) continue;
+
+      const momentum5m = priceData.priceChange5m >= 3;
+      const momentum1h = priceData.priceChange1h >= 5;
+      const goodVolume = priceData.volume5m >= 50000;
+
+      if (momentum5m && momentum1h && goodVolume) {
+        log('SIGNAL ' + symbol + ' | 5m: +' + priceData.priceChange5m.toFixed(1) + '% | 1h: +' + priceData.priceChange1h.toFixed(1) + '%');
+        await enterTrade(token, priceData);
+      }
+
+    } catch (e) {
+      log('Error scanning ' + token.symbol + ': ' + e.message);
+    }
   }
 }
 
 async function cleanupRecentlyTraded() {
   const now = Date.now();
   for (const mint in state.recentlyTraded) {
-    if (now - state.recentlyTraded[mint] > 30 * 60 * 1000) {
+    if (now - state.recentlyTraded[mint] > 20 * 60 * 1000) {
       delete state.recentlyTraded[mint];
     }
   }
@@ -321,16 +317,16 @@ async function cleanupRecentlyTraded() {
 
 async function mainLoop() {
   while (state.running) {
-    await scanDexScreener();
-    await monitorPositions();
+    await scan();
     await cleanupRecentlyTraded();
     await new Promise(function(r) { setTimeout(r, CONFIG.SCAN_INTERVAL_MS); });
   }
 }
 
 async function main() {
-  log('PUMP.FUN MOMENTUM TRADER v4');
-  log('Data: DexScreener | Strategy: 5min momentum on Solana tokens');
+  log('SOLANA MOMENTUM TRADER v5');
+  log('Strategy: Momentum trading on established Solana tokens via Raydium');
+  log('Tokens: WIF, BONK, POPCAT, MEW, MYRO, BOME, SLERF, PONKE');
 
   state.wallet = loadWallet();
   state.connection = new Connection(CONFIG.RPC_URL, 'confirmed');
@@ -338,25 +334,25 @@ async function main() {
   await updateBalance();
   brain.startingBalance = state.solBalance;
   log('Starting balance: ' + state.solBalance.toFixed(4) + ' SOL');
-  log('TP: ' + (brain.takeProfit * 100).toFixed(0) + '% | SL: ' + (brain.stopLoss * 100).toFixed(0) + '% | Min momentum: ' + brain.minMomentumPct + '%');
+  log('TP: ' + (brain.takeProfit * 100).toFixed(0) + '% | SL: ' + (brain.stopLoss * 100).toFixed(0) + '% | Size: ' + brain.solPerTrade.toFixed(3) + ' SOL/trade');
   log('Running until: ' + new Date(Date.now() + CONFIG.RUNTIME_MS).toISOString());
 
   mainLoop();
 
   setInterval(function() {
     const wr = brain.totalTrades > 0 ? ((brain.wins / brain.totalTrades) * 100).toFixed(0) : 0;
-    log('STATS | ' + brain.wins + 'W/' + brain.losses + 'L (' + wr + '%) | PnL: ' + brain.totalPnlSOL.toFixed(4) + ' SOL | Bal: ' + state.solBalance.toFixed(4) + ' SOL | Streak: ' + brain.streak + ' | Open: ' + Object.keys(state.positions).length);
+    log('STATS | ' + brain.wins + 'W/' + brain.losses + 'L (' + wr + '%) | PnL: ' + (brain.totalPnlSOL > 0 ? '+' : '') + brain.totalPnlSOL.toFixed(4) + ' SOL | Bal: ' + state.solBalance.toFixed(4) + ' SOL | Open: ' + Object.keys(state.positions).length);
   }, 3 * 60 * 1000);
 
   setTimeout(async function() {
     log('24h complete - closing all positions');
     state.running = false;
     for (const mint in state.positions) {
-      await exitPos(mint, 'END_OF_RUN');
+      await exitTrade(mint, 'END_OF_RUN');
     }
     await updateBalance();
     const profit = state.solBalance - brain.startingBalance;
-    log('FINAL: ' + state.solBalance.toFixed(4) + ' SOL | ' + (profit > 0 ? '+' : '') + profit.toFixed(4) + ' SOL profit | ' + brain.wins + 'W/' + brain.losses + 'L');
+    log('FINAL: ' + state.solBalance.toFixed(4) + ' SOL | ' + (profit > 0 ? '+' : '') + profit.toFixed(4) + ' SOL | ' + brain.wins + 'W/' + brain.losses + 'L');
     process.exit(0);
   }, CONFIG.RUNTIME_MS);
 }
@@ -364,7 +360,7 @@ async function main() {
 process.on('SIGINT', async function() {
   state.running = false;
   for (const mint in state.positions) {
-    await exitPos(mint, 'MANUAL_STOP');
+    await exitTrade(mint, 'MANUAL_STOP');
   }
   const profit = state.solBalance - brain.startingBalance;
   log('Stopped: ' + state.solBalance.toFixed(4) + ' SOL | ' + (profit > 0 ? '+' : '') + profit.toFixed(4) + ' SOL');
