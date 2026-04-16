@@ -347,4 +347,23 @@ async function main() {
       await exitPos(mint, 'END_OF_RUN');
     }
     await updateBalance();
-    const​​​​​​​​​​​​​​​​
+    const profit = state.solBalance - brain.startingBalance;
+    log('FINAL: ' + state.solBalance.toFixed(4) + ' SOL | ' + (profit > 0 ? '+' : '') + profit.toFixed(4) + ' SOL profit | ' + brain.wins + 'W/' + brain.losses + 'L');
+    process.exit(0);
+  }, CONFIG.RUNTIME_MS);
+}
+
+process.on('SIGINT', async function() {
+  state.running = false;
+  for (const mint in state.positions) {
+    await exitPos(mint, 'MANUAL_STOP');
+  }
+  const profit = state.solBalance - brain.startingBalance;
+  log('Stopped: ' + state.solBalance.toFixed(4) + ' SOL | ' + (profit > 0 ? '+' : '') + profit.toFixed(4) + ' SOL');
+  process.exit(0);
+});
+
+main().catch(function(e) {
+  log('Fatal: ' + e.message);
+  process.exit(1);
+});
