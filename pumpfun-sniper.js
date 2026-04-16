@@ -140,27 +140,6 @@ const CONFIG = {
   TRADE_URL: 'https://pumpportal.fun/api/trade',
 };
 
-async function getBalance() {
-  try {
-    const res = await fetch('https://pumpportal.fun/api/trade?api-key=' + CONFIG.API_KEY, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'buy',
-        mint: 'So11111111111111111111111111111111111111112',
-        amount: 0,
-        denominatedInSol: 'true',
-        slippage: 1,
-        priorityFee: 0,
-        pool: 'pump'
-      }),
-    });
-  } catch (e) {}
-
-  // Use DexScreener to check portfolio value instead
-  return state.solBalance;
-}
-
 async function trade(action, mint, amount, denominatedInSol) {
   const body = {
     action: action,
@@ -179,10 +158,16 @@ async function trade(action, mint, amount, denominatedInSol) {
     body: JSON.stringify(body),
   });
 
-  const data = await res.json();
-  if (data.errors) throw new Error(JSON.stringify(data.errors));
-  if (!data.signature) throw new Error('No signature in response: ' + JSON.stringify(data));
-  return data.signature;
+  const text = await res.text();
+  log('API response: ' + text.slice(0, 150));
+
+  let data;
+  try { data = JSON.parse(text); } catch (e) { throw new Error('Bad response: ' + text.slice(0, 100)); }
+
+  if (Array.isArray(data) && data.length > 0) return data[0];
+  if (data && data.signature) return data.signature;
+  if (typeof data === 'string' && data.length > 20) return data;
+  throw new Error('Trade failed: ' + JSON.stringify(data).slice(0, 200));
 }
 
 async function snipe(mint, symbol, devBuy) {
@@ -191,7 +176,7 @@ async function snipe(mint, symbol, devBuy) {
   if (Object.keys(state.positions).length >= CONFIG.MAX_POSITIONS) return;
   if (state.totalSpent >= CONFIG.MAX_TOTAL_SOL) { log('Spend cap hit'); return; }
 
-  const size = Math.max(0.02, Math.min(brain.solPerSnipe, 0.49 * 0.08));
+  const size = Math.max(0.02, Math.min(brain.solPerSnipe, 0.45 * 0.08));
 
   try {
     log('SNIPE ' + symbol + ' | Dev: ' + devBuy.toFixed(3) + ' SOL | Size: ' + size.toFixed(3) + ' SOL | TP: ' + (brain.takeProfit * 100).toFixed(0) + '% | SL: ' + (brain.stopLoss * 100).toFixed(0) + '%');
@@ -212,7 +197,7 @@ async function snipe(mint, symbol, devBuy) {
 
     state.totalSpent += size;
     state.trades.push({ type: 'BUY', symbol: symbol, mint: mint, solSpent: size, sig: sig, time: new Date().toISOString() });
-    log('Position open: ' + Object.keys(state.positions).length + ' total | Spent: ' + state.totalSpent.toFixed(3) + ' SOL');
+    log('Positions open: ' + Object.keys(state.positions).length + ' | Total spent: ' + state.totalSpent.toFixed(3) + ' SOL');
 
     setTimeout(function() {
       if (state.positions[mint]) exitPos(mint, 'TIMEOUT');
@@ -230,22 +215,19 @@ async function exitPos(mint, reason) {
     log('SELLING ' + pos.symbol + ' | reason: ' + reason);
     const sig = await trade('sell', mint, '100%', false);
     const holdTime = (Date.now() - pos.entryTime) / 1000;
-
     log('SELL confirmed ' + pos.symbol + ' | tx: ' + sig + ' | held: ' + holdTime.toFixed(0) + 's');
 
     state.trades.push({ type: 'SELL', symbol: pos.symbol, mint: mint, reason: reason, sig: sig, time: new Date().toISOString() });
     delete state.positions[mint];
     state.recentlyTraded[mint] = Date.now();
 
-    // We use a simple estimate for PnL since Lightning API handles everything
     const estimatedPnl = reason === 'TAKE_PROFIT' ? pos.solSpent * brain.takeProfit : reason === 'STOP_LOSS' ? -(pos.solSpent * brain.stopLoss) : 0;
     const estimatedPct = (estimatedPnl / pos.solSpent) * 100;
-
     recordTrade(estimatedPnl, estimatedPct, holdTime, pos.devBuy, reason);
 
     const result = estimatedPnl > 0 ? 'WIN' : estimatedPnl < 0 ? 'LOSS' : 'TIMEOUT';
     log(result + ' ' + pos.symbol + ' | est: ' + (estimatedPnl > 0 ? '+' : '') + estimatedPnl.toFixed(4) + ' SOL | ' + holdTime.toFixed(0) + 's | ' + reason);
-    log('Brain: ' + brain.wins + 'W/' + brain.losses + 'L | Streak: ' + brain.streak);
+    log('Brain: ' + brain.wins + 'W/' + brain.losses + 'L | Streak: ' + brain.streak + ' | PnL: ' + (brain.totalPnlSOL > 0 ? '+' : '') + brain.totalPnlSOL.toFixed(4) + ' SOL');
     fs.writeFileSync('./trades.json', JSON.stringify({ trades: state.trades, brain: brain }, null, 2));
   } catch (e) {
     log('Sell failed ' + pos.symbol + ': ' + e.message);
@@ -265,7 +247,6 @@ async function monitorPositions() {
 
         const pair = data.pairs[0];
         const priceChange = pair.priceChange ? (pair.priceChange.m5 || 0) : 0;
-
         log('Monitor ' + pos.symbol + ' | 5m: ' + priceChange.toFixed(1) + '%');
 
         if (priceChange >= pos.tp * 100) {
@@ -328,25 +309,24 @@ async function cleanupRecentlyTraded() {
 }
 
 async function main() {
-  log('PUMP.FUN LIGHTNING SNIPER v8');
-  log('Engine: PumpPortal Lightning API - no tx building needed!');
+  log('PUMP.FUN LIGHTNING SNIPER v9');
+  log('Engine: PumpPortal Lightning API');
 
   if (!CONFIG.API_KEY) {
-    log('ERROR: PUMPPORTAL_KEY not set in environment variables');
+    log('ERROR: PUMPPORTAL_KEY not set');
     process.exit(1);
   }
 
-  log('API Key: ' + CONFIG.API_KEY.slice(0, 20) + '...');
+  log('API Key loaded: ' + CONFIG.API_KEY.slice(0, 20) + '...');
   log('TP: ' + (brain.takeProfit * 100).toFixed(0) + '% | SL: ' + (brain.stopLoss * 100).toFixed(0) + '% | Size: ' + brain.solPerSnipe.toFixed(3) + ' SOL | Min dev buy: ' + brain.minDevBuy + ' SOL');
   log('Running until: ' + new Date(Date.now() + CONFIG.RUNTIME_MS).toISOString());
-  log('Spend cap: ' + CONFIG.MAX_TOTAL_SOL + ' SOL | Max positions: ' + CONFIG.MAX_POSITIONS);
 
   connect();
   monitorPositions();
 
   setInterval(function() {
     const wr = brain.totalTrades > 0 ? ((brain.wins / brain.totalTrades) * 100).toFixed(0) : 0;
-    log('STATS | ' + brain.wins + 'W/' + brain.losses + 'L (' + wr + '%) | Streak: ' + brain.streak + ' | Open positions: ' + Object.keys(state.positions).length + ' | Spent: ' + state.totalSpent.toFixed(3) + ' SOL');
+    log('STATS | ' + brain.wins + 'W/' + brain.losses + 'L (' + wr + '%) | Streak: ' + brain.streak + ' | Open: ' + Object.keys(state.positions).length + ' | Spent: ' + state.totalSpent.toFixed(3) + ' SOL');
   }, 3 * 60 * 1000);
 
   setInterval(cleanupRecentlyTraded, 30000);
@@ -357,7 +337,7 @@ async function main() {
     for (const mint in state.positions) {
       await exitPos(mint, 'END_OF_RUN');
     }
-    log('FINAL: ' + brain.wins + 'W/' + brain.losses + 'L | Brain PnL: ' + (brain.totalPnlSOL > 0 ? '+' : '') + brain.totalPnlSOL.toFixed(4) + ' SOL');
+    log('FINAL: ' + brain.wins + 'W/' + brain.losses + 'L | PnL: ' + (brain.totalPnlSOL > 0 ? '+' : '') + brain.totalPnlSOL.toFixed(4) + ' SOL');
     process.exit(0);
   }, CONFIG.RUNTIME_MS);
 }
