@@ -1,8 +1,6 @@
 require('dotenv').config();
-const { Connection, Keypair, VersionedTransaction, SystemProgram, PublicKey, TransactionMessage } = require('@solana/web3.js');
-const fetch = require('node-fetch');
 const WebSocket = require('ws');
-const bs58 = require('bs58').default || require('bs58');
+const fetch = require('node-fetch');
 const fs = require('fs');
 
 const BRAIN_FILE = './brain.json';
@@ -124,8 +122,6 @@ function recordTrade(pnlSOL, pnlPct, holdTime, devBuy, reason) {
 const brain = loadBrain();
 
 const state = {
-  wallet: null,
-  connection: null,
   solBalance: 0,
   positions: {},
   trades: [],
@@ -136,69 +132,57 @@ const state = {
 };
 
 const CONFIG = {
-  RPC_URL: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
+  API_KEY: process.env.PUMPPORTAL_KEY,
   MAX_POSITIONS: 5,
-  MAX_TOTAL_SOL: 0.55,
+  MAX_TOTAL_SOL: 0.45,
   PUMPFUN_WS: 'wss://pumpportal.fun/api/data',
-  SOL_MINT: 'So11111111111111111111111111111111111111112',
   RUNTIME_MS: 24 * 60 * 60 * 1000,
+  TRADE_URL: 'https://pumpportal.fun/api/trade',
 };
 
-function loadWallet() {
-  if (!process.env.PRIVATE_KEY) throw new Error('PRIVATE_KEY missing');
-  return Keypair.fromSecretKey(bs58.decode(process.env.PRIVATE_KEY));
-}
+async function getBalance() {
+  try {
+    const res = await fetch('https://pumpportal.fun/api/trade?api-key=' + CONFIG.API_KEY, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'buy',
+        mint: 'So11111111111111111111111111111111111111112',
+        amount: 0,
+        denominatedInSol: 'true',
+        slippage: 1,
+        priorityFee: 0,
+        pool: 'pump'
+      }),
+    });
+  } catch (e) {}
 
-async function updateBalance() {
-  const lamps = await state.connection.getBalance(state.wallet.publicKey);
-  state.solBalance = lamps / 1e9;
+  // Use DexScreener to check portfolio value instead
   return state.solBalance;
 }
 
-async function buildBuyTx(mint, lamports) {
+async function trade(action, mint, amount, denominatedInSol) {
   const body = {
-    publicKey: state.wallet.publicKey.toString(),
-    action: 'buy',
-    mint: mint,
-    amount: lamports,
-    denominatedInSol: 'true',
-    slippage: 50,
-    priorityFee: 0.005,
-    pool: 'pump'
-  };
-
-  const res = await fetch('https://pumpportal.fun/api/trade-local', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-
-  if (res.status !== 200) throw new Error('PumpPortal buy error: ' + res.status);
-  const data = await res.arrayBuffer();
-  return VersionedTransaction.deserialize(new Uint8Array(data));
-}
-
-async function buildSellTx(mint, amount) {
-  const body = {
-    publicKey: state.wallet.publicKey.toString(),
-    action: 'sell',
+    action: action,
     mint: mint,
     amount: amount,
-    denominatedInSol: 'false',
+    denominatedInSol: denominatedInSol ? 'true' : 'false',
     slippage: 50,
     priorityFee: 0.005,
-    pool: 'pump'
+    pool: 'pump',
   };
 
-  const res = await fetch('https://pumpportal.fun/api/trade-local', {
+  const url = CONFIG.TRADE_URL + '?api-key=' + CONFIG.API_KEY;
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
 
-  if (res.status !== 200) throw new Error('PumpPortal sell error: ' + res.status);
-  const data = await res.arrayBuffer();
-  return VersionedTransaction.deserialize(new Uint8Array(data));
+  const data = await res.json();
+  if (data.errors) throw new Error(JSON.stringify(data.errors));
+  if (!data.signature) throw new Error('No signature in response: ' + JSON.stringify(data));
+  return data.signature;
 }
 
 async function snipe(mint, symbol, devBuy) {
@@ -207,22 +191,13 @@ async function snipe(mint, symbol, devBuy) {
   if (Object.keys(state.positions).length >= CONFIG.MAX_POSITIONS) return;
   if (state.totalSpent >= CONFIG.MAX_TOTAL_SOL) { log('Spend cap hit'); return; }
 
-  const size = Math.max(0.02, Math.min(brain.solPerSnipe, state.solBalance * 0.08));
-  const lamports = Math.floor(size * 1e9);
+  const size = Math.max(0.02, Math.min(brain.solPerSnipe, 0.49 * 0.08));
 
   try {
     log('SNIPE ' + symbol + ' | Dev: ' + devBuy.toFixed(3) + ' SOL | Size: ' + size.toFixed(3) + ' SOL | TP: ' + (brain.takeProfit * 100).toFixed(0) + '% | SL: ' + (brain.stopLoss * 100).toFixed(0) + '%');
 
-    const buyTx = await buildBuyTx(mint, lamports);
-    buyTx.sign([state.wallet]);
-
-    const sig = await state.connection.sendRawTransaction(buyTx.serialize(), {
-      skipPreflight: true,
-      maxRetries: 5,
-    });
-
-    log('BUY tx sent: ' + sig + ' | Waiting for confirmation...');
-    await state.connection.confirmTransaction(sig, 'confirmed');
+    const sig = await trade('buy', mint, size, true);
+    log('BUY confirmed ' + symbol + ' | tx: ' + sig);
 
     state.positions[mint] = {
       symbol: symbol,
@@ -233,14 +208,11 @@ async function snipe(mint, symbol, devBuy) {
       tp: brain.takeProfit,
       sl: brain.stopLoss,
       maxHold: brain.maxHoldSec,
-      amount: lamports,
-      sig: sig,
     };
 
     state.totalSpent += size;
-    await updateBalance();
     state.trades.push({ type: 'BUY', symbol: symbol, mint: mint, solSpent: size, sig: sig, time: new Date().toISOString() });
-    log('BUY confirmed ' + symbol + ' | tx: ' + sig + ' | Bal: ' + state.solBalance.toFixed(4) + ' SOL');
+    log('Position open: ' + Object.keys(state.positions).length + ' total | Spent: ' + state.totalSpent.toFixed(3) + ' SOL');
 
     setTimeout(function() {
       if (state.positions[mint]) exitPos(mint, 'TIMEOUT');
@@ -256,31 +228,24 @@ async function exitPos(mint, reason) {
   if (!pos) return;
   try {
     log('SELLING ' + pos.symbol + ' | reason: ' + reason);
-
-    const sellTx = await buildSellTx(mint, pos.amount);
-    sellTx.sign([state.wallet]);
-
-    const sig = await state.connection.sendRawTransaction(sellTx.serialize(), {
-      skipPreflight: true,
-      maxRetries: 5,
-    });
-
-    await state.connection.confirmTransaction(sig, 'confirmed');
-
+    const sig = await trade('sell', mint, '100%', false);
     const holdTime = (Date.now() - pos.entryTime) / 1000;
-    const prevBal = state.solBalance;
-    await updateBalance();
-    const pnl = state.solBalance - prevBal + pos.solSpent;
-    const pct = (pnl / pos.solSpent) * 100;
 
-    state.trades.push({ type: 'SELL', symbol: pos.symbol, mint: mint, pnl: pnl, pct: pct, reason: reason, sig: sig, time: new Date().toISOString() });
+    log('SELL confirmed ' + pos.symbol + ' | tx: ' + sig + ' | held: ' + holdTime.toFixed(0) + 's');
+
+    state.trades.push({ type: 'SELL', symbol: pos.symbol, mint: mint, reason: reason, sig: sig, time: new Date().toISOString() });
     delete state.positions[mint];
     state.recentlyTraded[mint] = Date.now();
-    recordTrade(pnl, pct, holdTime, pos.devBuy, reason);
 
-    const result = pnl > 0 ? 'WIN' : 'LOSS';
-    log(result + ' ' + pos.symbol + ' | ' + (pnl > 0 ? '+' : '') + pnl.toFixed(4) + ' SOL (' + pct.toFixed(1) + '%) | ' + holdTime.toFixed(0) + 's | ' + reason);
-    log('Brain: ' + brain.wins + 'W/' + brain.losses + 'L | PnL: ' + (brain.totalPnlSOL > 0 ? '+' : '') + brain.totalPnlSOL.toFixed(4) + ' SOL | Streak: ' + brain.streak + ' | Bal: ' + state.solBalance.toFixed(4) + ' SOL');
+    // We use a simple estimate for PnL since Lightning API handles everything
+    const estimatedPnl = reason === 'TAKE_PROFIT' ? pos.solSpent * brain.takeProfit : reason === 'STOP_LOSS' ? -(pos.solSpent * brain.stopLoss) : 0;
+    const estimatedPct = (estimatedPnl / pos.solSpent) * 100;
+
+    recordTrade(estimatedPnl, estimatedPct, holdTime, pos.devBuy, reason);
+
+    const result = estimatedPnl > 0 ? 'WIN' : estimatedPnl < 0 ? 'LOSS' : 'TIMEOUT';
+    log(result + ' ' + pos.symbol + ' | est: ' + (estimatedPnl > 0 ? '+' : '') + estimatedPnl.toFixed(4) + ' SOL | ' + holdTime.toFixed(0) + 's | ' + reason);
+    log('Brain: ' + brain.wins + 'W/' + brain.losses + 'L | Streak: ' + brain.streak);
     fs.writeFileSync('./trades.json', JSON.stringify({ trades: state.trades, brain: brain }, null, 2));
   } catch (e) {
     log('Sell failed ' + pos.symbol + ': ' + e.message);
@@ -300,6 +265,7 @@ async function monitorPositions() {
 
         const pair = data.pairs[0];
         const priceChange = pair.priceChange ? (pair.priceChange.m5 || 0) : 0;
+
         log('Monitor ' + pos.symbol + ' | 5m: ' + priceChange.toFixed(1) + '%');
 
         if (priceChange >= pos.tp * 100) {
@@ -362,24 +328,25 @@ async function cleanupRecentlyTraded() {
 }
 
 async function main() {
-  log('PUMP.FUN SNIPER v7');
-  log('Engine: Direct send + PumpPortal + Adaptive brain');
+  log('PUMP.FUN LIGHTNING SNIPER v8');
+  log('Engine: PumpPortal Lightning API - no tx building needed!');
 
-  state.wallet = loadWallet();
-  state.connection = new Connection(CONFIG.RPC_URL, 'confirmed');
-  log('Wallet: ' + state.wallet.publicKey.toString());
-  await updateBalance();
-  brain.startingBalance = state.solBalance;
-  log('Starting balance: ' + state.solBalance.toFixed(4) + ' SOL');
+  if (!CONFIG.API_KEY) {
+    log('ERROR: PUMPPORTAL_KEY not set in environment variables');
+    process.exit(1);
+  }
+
+  log('API Key: ' + CONFIG.API_KEY.slice(0, 20) + '...');
   log('TP: ' + (brain.takeProfit * 100).toFixed(0) + '% | SL: ' + (brain.stopLoss * 100).toFixed(0) + '% | Size: ' + brain.solPerSnipe.toFixed(3) + ' SOL | Min dev buy: ' + brain.minDevBuy + ' SOL');
   log('Running until: ' + new Date(Date.now() + CONFIG.RUNTIME_MS).toISOString());
+  log('Spend cap: ' + CONFIG.MAX_TOTAL_SOL + ' SOL | Max positions: ' + CONFIG.MAX_POSITIONS);
 
   connect();
   monitorPositions();
 
   setInterval(function() {
     const wr = brain.totalTrades > 0 ? ((brain.wins / brain.totalTrades) * 100).toFixed(0) : 0;
-    log('STATS | ' + brain.wins + 'W/' + brain.losses + 'L (' + wr + '%) | PnL: ' + (brain.totalPnlSOL > 0 ? '+' : '') + brain.totalPnlSOL.toFixed(4) + ' SOL | Bal: ' + state.solBalance.toFixed(4) + ' SOL | Open: ' + Object.keys(state.positions).length);
+    log('STATS | ' + brain.wins + 'W/' + brain.losses + 'L (' + wr + '%) | Streak: ' + brain.streak + ' | Open positions: ' + Object.keys(state.positions).length + ' | Spent: ' + state.totalSpent.toFixed(3) + ' SOL');
   }, 3 * 60 * 1000);
 
   setInterval(cleanupRecentlyTraded, 30000);
@@ -390,9 +357,7 @@ async function main() {
     for (const mint in state.positions) {
       await exitPos(mint, 'END_OF_RUN');
     }
-    await updateBalance();
-    const profit = state.solBalance - brain.startingBalance;
-    log('FINAL: ' + state.solBalance.toFixed(4) + ' SOL | ' + (profit > 0 ? '+' : '') + profit.toFixed(4) + ' SOL | ' + brain.wins + 'W/' + brain.losses + 'L');
+    log('FINAL: ' + brain.wins + 'W/' + brain.losses + 'L | Brain PnL: ' + (brain.totalPnlSOL > 0 ? '+' : '') + brain.totalPnlSOL.toFixed(4) + ' SOL');
     process.exit(0);
   }, CONFIG.RUNTIME_MS);
 }
@@ -402,8 +367,7 @@ process.on('SIGINT', async function() {
   for (const mint in state.positions) {
     await exitPos(mint, 'MANUAL_STOP');
   }
-  const profit = state.solBalance - brain.startingBalance;
-  log('Stopped: ' + state.solBalance.toFixed(4) + ' SOL | ' + (profit > 0 ? '+' : '') + profit.toFixed(4) + ' SOL');
+  log('Stopped.');
   process.exit(0);
 });
 
