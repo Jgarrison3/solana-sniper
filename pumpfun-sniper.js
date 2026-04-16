@@ -33,7 +33,7 @@ function loadBrain() {
     stopLoss: 0.30,
     maxHoldSec: 300,
     solPerSnipe: 0.05,
-    minMomentumPct: 20,
+    minMomentumPct: 5,
     streak: 0,
     bestStreak: 0,
     recentTrades: [],
@@ -77,10 +77,10 @@ function adapt() {
   }
 
   if (recentWinRate < 0.25 && totalTrades >= 5) {
-    brain.minMomentumPct = Math.min(50, brain.minMomentumPct + 5);
+    brain.minMomentumPct = Math.min(30, brain.minMomentumPct + 2);
     log('Brain: Raising momentum threshold to ' + brain.minMomentumPct + '%');
   } else if (recentWinRate > 0.6 && totalTrades >= 5) {
-    brain.minMomentumPct = Math.max(10, brain.minMomentumPct - 5);
+    brain.minMomentumPct = Math.max(3, brain.minMomentumPct - 2);
     log('Brain: Lowering momentum threshold to ' + brain.minMomentumPct + '%');
   }
 
@@ -118,7 +118,7 @@ const state = {
   solBalance: 0,
   positions: {},
   trades: [],
-  watchlist: {},
+  recentlyTraded: {},
   totalSpent: 0,
   startTime: Date.now(),
   running: true,
@@ -177,6 +177,7 @@ async function swap(isBuy, mint, lamports) {
 
 async function buy(mint, symbol, priceChange) {
   if (state.positions[mint]) return;
+  if (state.recentlyTraded[mint]) return;
   if (Object.keys(state.positions).length >= CONFIG.MAX_POSITIONS) return;
   if (state.totalSpent >= CONFIG.MAX_TOTAL_SOL) { log('Spend cap hit'); return; }
 
@@ -184,7 +185,7 @@ async function buy(mint, symbol, priceChange) {
   const lamports = Math.floor(size * 1e9);
 
   try {
-    log('BUY ' + symbol + ' | 5min change: +' + priceChange.toFixed(1) + '% | Size: ' + size.toFixed(3) + ' SOL | TP: ' + (brain.takeProfit * 100).toFixed(0) + '% | SL: ' + (brain.stopLoss * 100).toFixed(0) + '%');
+    log('BUY ' + symbol + ' | 5m change: +' + priceChange.toFixed(1) + '% | Size: ' + size.toFixed(3) + ' SOL | TP: ' + (brain.takeProfit * 100).toFixed(0) + '% | SL: ' + (brain.stopLoss * 100).toFixed(0) + '%');
     const sig = await swap(true, mint, lamports);
 
     state.positions[mint] = {
@@ -196,15 +197,13 @@ async function buy(mint, symbol, priceChange) {
       sl: brain.stopLoss,
       maxHold: brain.maxHoldSec,
       amount: lamports,
-      entryPrice: 0,
+      entryPriceChange: priceChange,
     };
 
     state.totalSpent += size;
     await updateBalance();
     state.trades.push({ type: 'BUY', symbol: symbol, mint: mint, solSpent: size, sig: sig, time: new Date().toISOString() });
     log('BUY confirmed ' + symbol + ' | tx: ' + sig + ' | Bal: ' + state.solBalance.toFixed(4) + ' SOL');
-
-    delete state.watchlist[mint];
 
     setTimeout(function() {
       if (state.positions[mint]) exitPos(mint, 'TIMEOUT');
@@ -229,6 +228,7 @@ async function exitPos(mint, reason) {
 
     state.trades.push({ type: 'SELL', symbol: pos.symbol, mint: mint, reason: reason, sig: sig, time: new Date().toISOString() });
     delete state.positions[mint];
+    state.recentlyTraded[mint] = Date.now();
     recordTrade(pnl, pct, holdTime, reason);
 
     const result = pnl > 0 ? 'WIN' : 'LOSS';
@@ -242,46 +242,43 @@ async function exitPos(mint, reason) {
 
 async function scanDexScreener() {
   try {
-    const url = 'https://api.dexscreener.com/token-boosts/latest/v1';
+    const url = 'https://api.dexscreener.com/latest/dex/search?q=pump&order=desc&sortBy=volume';
     const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
     if (!res.ok) {
       log('DexScreener error: ' + res.status);
       return;
     }
-    const tokens = await res.json();
-    log('DexScreener scan: ' + tokens.length + ' tokens found');
+    const data = await res.json();
+    const pairs = data.pairs || [];
 
-    for (const token of tokens) {
-      if (!token.tokenAddress || !token.chainId) continue;
-      if (token.chainId !== 'solana') continue;
+    let candidates = 0;
+    for (const pair of pairs) {
+      if (!pair.chainId || pair.chainId !== 'solana') continue;
+      if (!pair.baseToken || !pair.baseToken.address) continue;
 
-      const mint = token.tokenAddress;
-      if (state.positions[mint]) continue;
-
-      const pairUrl = 'https://api.dexscreener.com/latest/dex/tokens/' + mint;
-      const pairRes = await fetch(pairUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-      if (!pairRes.ok) continue;
-      const pairData = await pairRes.json();
-
-      if (!pairData.pairs || pairData.pairs.length === 0) continue;
-
-      const pair = pairData.pairs[0];
-      const symbol = pair.baseToken ? pair.baseToken.symbol : 'UNKNOWN';
+      const mint = pair.baseToken.address;
+      const symbol = pair.baseToken.symbol || 'UNKNOWN';
       const priceChange5m = pair.priceChange ? (pair.priceChange.m5 || 0) : 0;
       const volume5m = pair.volume ? (pair.volume.m5 || 0) : 0;
       const liquidity = pair.liquidity ? (pair.liquidity.usd || 0) : 0;
       const pairCreated = pair.pairCreatedAt || 0;
       const ageMin = pairCreated > 0 ? (Date.now() - pairCreated) / 1000 / 60 : 999;
 
-      if (ageMin < 2 || ageMin > 60) continue;
-      if (liquidity < 1000) continue;
-      if (volume5m < 500) continue;
+      if (state.positions[mint] || state.recentlyTraded[mint]) continue;
+      if (ageMin < 1 || ageMin > 120) continue;
+      if (liquidity < 500) continue;
+      if (volume5m < 100) continue;
+
+      candidates++;
 
       if (priceChange5m >= brain.minMomentumPct) {
-        log('MOMENTUM ' + symbol + ' | 5m: +' + priceChange5m.toFixed(1) + '% | Vol5m: $' + volume5m.toFixed(0) + ' | Liq: $' + liquidity.toFixed(0) + ' | Age: ' + ageMin.toFixed(1) + 'min');
+        log('MOMENTUM ' + symbol + ' | 5m: +' + priceChange5m.toFixed(1) + '% | Vol: $' + volume5m.toFixed(0) + ' | Age: ' + ageMin.toFixed(1) + 'min');
         await buy(mint, symbol, priceChange5m);
       }
     }
+
+    log('Scan complete: ' + pairs.length + ' pairs | ' + candidates + ' candidates | ' + Object.keys(state.positions).length + ' positions open');
+
   } catch (e) {
     log('Scan error: ' + e.message);
   }
@@ -291,23 +288,34 @@ async function monitorPositions() {
   for (const mint in state.positions) {
     try {
       const pos = state.positions[mint];
-      const pairUrl = 'https://api.dexscreener.com/latest/dex/tokens/' + mint;
-      const res = await fetch(pairUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const url = 'https://api.dexscreener.com/latest/dex/tokens/' + mint;
+      const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
       if (!res.ok) continue;
       const data = await res.json();
       if (!data.pairs || data.pairs.length === 0) continue;
 
       const pair = data.pairs[0];
-      const priceChange = pair.priceChange ? (pair.priceChange.h1 || 0) : 0;
+      const priceChange1h = pair.priceChange ? (pair.priceChange.h1 || 0) : 0;
 
-      if (priceChange >= pos.tp * 100) {
-        log('TP hit ' + pos.symbol + ': +' + priceChange.toFixed(1) + '%');
+      log('Monitor ' + pos.symbol + ' | 1h change: ' + priceChange1h.toFixed(1) + '% | TP: ' + (pos.tp * 100).toFixed(0) + '% | SL: -' + (pos.sl * 100).toFixed(0) + '%');
+
+      if (priceChange1h >= pos.tp * 100) {
+        log('TP hit ' + pos.symbol + ': +' + priceChange1h.toFixed(1) + '%');
         await exitPos(mint, 'TAKE_PROFIT');
-      } else if (priceChange <= -(pos.sl * 100)) {
-        log('SL hit ' + pos.symbol + ': ' + priceChange.toFixed(1) + '%');
+      } else if (priceChange1h <= -(pos.sl * 100)) {
+        log('SL hit ' + pos.symbol + ': ' + priceChange1h.toFixed(1) + '%');
         await exitPos(mint, 'STOP_LOSS');
       }
     } catch (e) {}
+  }
+}
+
+async function cleanupRecentlyTraded() {
+  const now = Date.now();
+  for (const mint in state.recentlyTraded) {
+    if (now - state.recentlyTraded[mint] > 30 * 60 * 1000) {
+      delete state.recentlyTraded[mint];
+    }
   }
 }
 
@@ -315,14 +323,14 @@ async function mainLoop() {
   while (state.running) {
     await scanDexScreener();
     await monitorPositions();
+    await cleanupRecentlyTraded();
     await new Promise(function(r) { setTimeout(r, CONFIG.SCAN_INTERVAL_MS); });
   }
 }
 
 async function main() {
   log('PUMP.FUN MOMENTUM TRADER v4');
-  log('Data source: DexScreener API');
-  log('Strategy: Buy Solana tokens showing 5min momentum');
+  log('Data: DexScreener | Strategy: 5min momentum on Solana tokens');
 
   state.wallet = loadWallet();
   state.connection = new Connection(CONFIG.RPC_URL, 'confirmed');
@@ -330,7 +338,7 @@ async function main() {
   await updateBalance();
   brain.startingBalance = state.solBalance;
   log('Starting balance: ' + state.solBalance.toFixed(4) + ' SOL');
-  log('TP: ' + (brain.takeProfit * 100).toFixed(0) + '% | SL: ' + (brain.stopLoss * 100).toFixed(0) + '% | Min 5m momentum: ' + brain.minMomentumPct + '%');
+  log('TP: ' + (brain.takeProfit * 100).toFixed(0) + '% | SL: ' + (brain.stopLoss * 100).toFixed(0) + '% | Min momentum: ' + brain.minMomentumPct + '%');
   log('Running until: ' + new Date(Date.now() + CONFIG.RUNTIME_MS).toISOString());
 
   mainLoop();
