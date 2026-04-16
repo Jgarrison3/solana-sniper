@@ -142,17 +142,6 @@ const CONFIG = {
   PUMPFUN_WS: 'wss://pumpportal.fun/api/data',
   SOL_MINT: 'So11111111111111111111111111111111111111112',
   RUNTIME_MS: 24 * 60 * 60 * 1000,
-  // Jito block engine endpoints - no signup needed
-  JITO_ENDPOINTS: [
-    'https://mainnet.block-engine.jito.wtf/api/v1/bundles',
-    'https://amsterdam.mainnet.block-engine.jito.wtf/api/v1/bundles',
-    'https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/bundles',
-    'https://ny.mainnet.block-engine.jito.wtf/api/v1/bundles',
-    'https://tokyo.mainnet.block-engine.jito.wtf/api/v1/bundles',
-  ],
-  // Jito tip account - required for bundles
-  JITO_TIP_ACCOUNT: 'Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY',
-  JITO_TIP_LAMPORTS: 100000, // 0.0001 SOL tip to validators
 };
 
 function loadWallet() {
@@ -166,13 +155,6 @@ async function updateBalance() {
   return state.solBalance;
 }
 
-// Get a fresh blockhash
-async function getBlockhash() {
-  const { blockhash } = await state.connection.getLatestBlockhash('confirmed');
-  return blockhash;
-}
-
-// Build pump.fun buy transaction via PumpPortal
 async function buildBuyTx(mint, lamports) {
   const body = {
     publicKey: state.wallet.publicKey.toString(),
@@ -180,8 +162,8 @@ async function buildBuyTx(mint, lamports) {
     mint: mint,
     amount: lamports,
     denominatedInSol: 'true',
-    slippage: 30,
-    priorityFee: 0,
+    slippage: 50,
+    priorityFee: 0.005,
     pool: 'pump'
   };
 
@@ -196,7 +178,6 @@ async function buildBuyTx(mint, lamports) {
   return VersionedTransaction.deserialize(new Uint8Array(data));
 }
 
-// Build pump.fun sell transaction via PumpPortal
 async function buildSellTx(mint, amount) {
   const body = {
     publicKey: state.wallet.publicKey.toString(),
@@ -204,8 +185,8 @@ async function buildSellTx(mint, amount) {
     mint: mint,
     amount: amount,
     denominatedInSol: 'false',
-    slippage: 30,
-    priorityFee: 0,
+    slippage: 50,
+    priorityFee: 0.005,
     pool: 'pump'
   };
 
@@ -220,58 +201,6 @@ async function buildSellTx(mint, amount) {
   return VersionedTransaction.deserialize(new Uint8Array(data));
 }
 
-// Build Jito tip transaction
-async function buildTipTx(blockhash) {
-  const tipIx = SystemProgram.transfer({
-    fromPubkey: state.wallet.publicKey,
-    toPubkey: new PublicKey(CONFIG.JITO_TIP_ACCOUNT),
-    lamports: CONFIG.JITO_TIP_LAMPORTS,
-  });
-
-  const msg = new TransactionMessage({
-    payerKey: state.wallet.publicKey,
-    recentBlockhash: blockhash,
-    instructions: [tipIx],
-  }).compileToV0Message();
-
-  return new VersionedTransaction(msg);
-}
-
-// Submit bundle to Jito - tries all endpoints
-async function submitJitoBundle(transactions) {
-  const serialized = transactions.map(function(tx) {
-    return bs58.encode(tx.serialize());
-  });
-
-  const body = JSON.stringify({
-    jsonrpc: '2.0',
-    id: 1,
-    method: 'sendBundle',
-    params: [serialized],
-  });
-
-  // Try all Jito endpoints simultaneously - fastest wins
-  const promises = CONFIG.JITO_ENDPOINTS.map(async function(endpoint) {
-    try {
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: body,
-      });
-      const data = await res.json();
-      if (data.result) return data.result;
-      throw new Error(JSON.stringify(data.error));
-    } catch (e) {
-      return null;
-    }
-  });
-
-  const results = await Promise.all(promises);
-  const success = results.find(function(r) { return r !== null; });
-  if (!success) throw new Error('All Jito endpoints failed');
-  return success;
-}
-
 async function snipe(mint, symbol, devBuy) {
   if (state.positions[mint]) return;
   if (state.recentlyTraded[mint]) return;
@@ -284,28 +213,16 @@ async function snipe(mint, symbol, devBuy) {
   try {
     log('SNIPE ' + symbol + ' | Dev: ' + devBuy.toFixed(3) + ' SOL | Size: ' + size.toFixed(3) + ' SOL | TP: ' + (brain.takeProfit * 100).toFixed(0) + '% | SL: ' + (brain.stopLoss * 100).toFixed(0) + '%');
 
-    // Get fresh blockhash
-    const blockhash = await getBlockhash();
-
-    // Build buy transaction
     const buyTx = await buildBuyTx(mint, lamports);
-
-    // Build tip transaction
-    const tipTx = await buildTipTx(blockhash);
-
-    // Update blockhash on buy tx
-    buyTx.message.recentBlockhash = blockhash;
-
-    // Sign both
     buyTx.sign([state.wallet]);
-    tipTx.sign([state.wallet]);
 
-    // Submit as Jito bundle - tip tx must be last
-    const bundleId = await submitJitoBundle([buyTx, tipTx]);
-    log('Jito bundle submitted: ' + bundleId);
+    const sig = await state.connection.sendRawTransaction(buyTx.serialize(), {
+      skipPreflight: true,
+      maxRetries: 5,
+    });
 
-    // Wait for confirmation
-    await new Promise(function(r) { setTimeout(r, 3000); });
+    log('BUY tx sent: ' + sig + ' | Waiting for confirmation...');
+    await state.connection.confirmTransaction(sig, 'confirmed');
 
     state.positions[mint] = {
       symbol: symbol,
@@ -317,13 +234,13 @@ async function snipe(mint, symbol, devBuy) {
       sl: brain.stopLoss,
       maxHold: brain.maxHoldSec,
       amount: lamports,
-      bundleId: bundleId,
+      sig: sig,
     };
 
     state.totalSpent += size;
     await updateBalance();
-    state.trades.push({ type: 'BUY', symbol: symbol, mint: mint, solSpent: size, bundleId: bundleId, time: new Date().toISOString() });
-    log('BUY confirmed ' + symbol + ' | Bundle: ' + bundleId + ' | Bal: ' + state.solBalance.toFixed(4) + ' SOL');
+    state.trades.push({ type: 'BUY', symbol: symbol, mint: mint, solSpent: size, sig: sig, time: new Date().toISOString() });
+    log('BUY confirmed ' + symbol + ' | tx: ' + sig + ' | Bal: ' + state.solBalance.toFixed(4) + ' SOL');
 
     setTimeout(function() {
       if (state.positions[mint]) exitPos(mint, 'TIMEOUT');
@@ -331,48 +248,6 @@ async function snipe(mint, symbol, devBuy) {
 
   } catch (e) {
     log('Snipe failed ' + symbol + ': ' + e.message);
-    // Fall back to direct send if Jito fails
-    await snipeDirect(mint, symbol, devBuy, lamports);
-  }
-}
-
-// Fallback: direct transaction if Jito fails
-async function snipeDirect(mint, symbol, devBuy, lamports) {
-  if (state.positions[mint]) return;
-  try {
-    log('Trying direct send for ' + symbol);
-    const buyTx = await buildBuyTx(mint, lamports);
-    buyTx.sign([state.wallet]);
-    const sig = await state.connection.sendRawTransaction(buyTx.serialize(), {
-      skipPreflight: true,
-      maxRetries: 3,
-    });
-    await state.connection.confirmTransaction(sig, 'confirmed');
-
-    const size = lamports / 1e9;
-    state.positions[mint] = {
-      symbol: symbol,
-      mint: mint,
-      entryTime: Date.now(),
-      solSpent: size,
-      devBuy: devBuy,
-      tp: brain.takeProfit,
-      sl: brain.stopLoss,
-      maxHold: brain.maxHoldSec,
-      amount: lamports,
-    };
-
-    state.totalSpent += size;
-    await updateBalance();
-    state.trades.push({ type: 'BUY', symbol: symbol, mint: mint, solSpent: size, sig: sig, time: new Date().toISOString() });
-    log('BUY confirmed (direct) ' + symbol + ' | tx: ' + sig + ' | Bal: ' + state.solBalance.toFixed(4) + ' SOL');
-
-    setTimeout(function() {
-      if (state.positions[mint]) exitPos(mint, 'TIMEOUT');
-    }, brain.maxHoldSec * 1000);
-
-  } catch (e) {
-    log('Direct send also failed ' + symbol + ': ' + e.message);
   }
 }
 
@@ -381,12 +256,15 @@ async function exitPos(mint, reason) {
   if (!pos) return;
   try {
     log('SELLING ' + pos.symbol + ' | reason: ' + reason);
+
     const sellTx = await buildSellTx(mint, pos.amount);
     sellTx.sign([state.wallet]);
+
     const sig = await state.connection.sendRawTransaction(sellTx.serialize(), {
       skipPreflight: true,
       maxRetries: 5,
     });
+
     await state.connection.confirmTransaction(sig, 'confirmed');
 
     const holdTime = (Date.now() - pos.entryTime) / 1000;
@@ -422,6 +300,7 @@ async function monitorPositions() {
 
         const pair = data.pairs[0];
         const priceChange = pair.priceChange ? (pair.priceChange.m5 || 0) : 0;
+        log('Monitor ' + pos.symbol + ' | 5m: ' + priceChange.toFixed(1) + '%');
 
         if (priceChange >= pos.tp * 100) {
           log('TP hit ' + pos.symbol + ': +' + priceChange.toFixed(1) + '%');
@@ -455,7 +334,7 @@ function connect() {
         if (!mint || !symbol) return;
         log('NEW ' + symbol + ' | Dev: ' + devBuy.toFixed(3) + ' SOL');
         if (devBuy < brain.minDevBuy) {
-          log('Skip ' + symbol + ' - dev buy too small (' + devBuy.toFixed(3) + ' < ' + brain.minDevBuy.toFixed(3) + ')');
+          log('Skip ' + symbol + ' - dev buy too small');
           return;
         }
         await snipe(mint, symbol, devBuy);
@@ -483,8 +362,8 @@ async function cleanupRecentlyTraded() {
 }
 
 async function main() {
-  log('PUMP.FUN JITO SNIPER v6');
-  log('Engine: Jito bundles + PumpPortal + Adaptive brain');
+  log('PUMP.FUN SNIPER v7');
+  log('Engine: Direct send + PumpPortal + Adaptive brain');
 
   state.wallet = loadWallet();
   state.connection = new Connection(CONFIG.RPC_URL, 'confirmed');
