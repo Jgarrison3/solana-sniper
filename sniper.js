@@ -3,7 +3,6 @@ const WebSocket = require('ws');
 const fetch = require('node-fetch');
 const fs = require('fs');
 
-// Optional deps — graceful degradation if not installed yet
 let Connection, PublicKey;
 try { ({ Connection, PublicKey } = require('@solana/web3.js')); } catch (_) {}
 let TelegramClient, StringSession, NewMessage;
@@ -21,36 +20,52 @@ function log(msg) {
   try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch (_) {}
 }
 
+// ─── RISK TIERS ───────────────────────────────────────────────────────────────
+// Bot auto-advances through tiers as win rate + streak improve.
+// Higher tiers = larger size, higher TP, looser filters, moonbag enabled.
+// Tier drops at most 2 levels per loss burst (shock absorber).
+const TIERS = [
+  //         name           minWR  minStreak  balPct  maxSOL  tp1%  tp2%  trailArm trailPct  SL%  maxPos  moonbag  fMult  maxHoldSec
+  tier(0, 'WARMUP',         0.00,   -99,      0.04,   0.10,   70,  100,    55,      22,      30,    2,    false,   1.00,   300),
+  tier(1, 'STANDARD',       0.40,     0,      0.06,   0.18,   75,  110,    55,      22,      30,    2,    false,   1.00,   300),
+  tier(2, 'CONFIDENT',      0.55,     2,      0.09,   0.30,   80,  150,    58,      20,      28,    3,    false,   0.90,   360),
+  tier(3, 'HOT',            0.63,     4,      0.13,   0.48,   90,  200,    62,      18,      26,    3,    true,    0.85,   420),
+  tier(4, 'AGGRESSIVE',     0.70,     6,      0.18,   0.75,  100,  260,    68,      15,      24,    4,    true,    0.80,   480),
+  tier(5, 'MAX_RISK',       0.76,     8,      0.24,   1.20,  110,  320,    74,      12,      22,    4,    true,    0.75,   540),
+];
+
+function tier(id, name, minWR, minStreak, balPct, maxSOL, tp1Pct, tp2Pct, trailArm, trailPct, slPct, maxPos, moonbag, fMult, maxHoldSec) {
+  return { id, name, minWR, minStreak, balPct, maxSOL, tp1Pct, tp2Pct, trailArm, trailPct, slPct, maxPos, moonbag, fMult, maxHoldSec };
+}
+
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const CONFIG = {
-  PUMPPORTAL_KEY:      process.env.PUMPPORTAL_KEY || '',
-  HELIUS_RPC:          process.env.HELIUS_RPC || 'https://api.mainnet-beta.solana.com',
-  WALLET_ADDRESS:      process.env.WALLET_ADDRESS || '',
+  PUMPPORTAL_KEY:     process.env.PUMPPORTAL_KEY || '',
+  HELIUS_RPC:         process.env.HELIUS_RPC || 'https://api.mainnet-beta.solana.com',
+  WALLET_ADDRESS:     process.env.WALLET_ADDRESS || '',
+  DAILY_LOSS_LIMIT:   parseFloat(process.env.DAILY_LOSS_LIMIT_SOL || '1.0'),
 
-  // Risk limits
-  MAX_POSITIONS:          parseInt(process.env.MAX_POSITIONS        || '3'),
-  DAILY_LOSS_LIMIT_SOL:   parseFloat(process.env.DAILY_LOSS_LIMIT_SOL || '0.5'),
+  // Base filter thresholds — scaled dynamically per tier and by learned values
+  MIN_SOL_IN_CURVE:      parseFloat(process.env.MIN_SOL_IN_CURVE      || '3.0'),
+  MAX_BONDING_CURVE_PCT: parseFloat(process.env.MAX_BONDING_CURVE_PCT || '28'),
+  MAX_DEV_HOLDING_PCT:   parseFloat(process.env.MAX_DEV_HOLDING_PCT   || '8'),
+  MIN_UNIQUE_BUYERS:     parseInt(  process.env.MIN_UNIQUE_BUYERS      || '6'),
+  MIN_BUY_SELL_RATIO:    parseFloat(process.env.MIN_BUY_SELL_RATIO     || '2.5'),
+  MIN_VOLUME_SOL:        parseFloat(process.env.MIN_VOLUME_SOL_WINDOW  || '1.5'),
+  OBSERVATION_MS:        parseInt(  process.env.OBSERVATION_MS         || '40000'),
 
-  // PumpFun token screening
-  MIN_SOL_IN_CURVE:       parseFloat(process.env.MIN_SOL_IN_CURVE   || '3'),
-  MAX_BONDING_CURVE_PCT:  parseFloat(process.env.MAX_BONDING_CURVE_PCT || '28'),
-  MAX_DEV_HOLDING_PCT:    parseFloat(process.env.MAX_DEV_HOLDING_PCT || '8'),
-  MIN_UNIQUE_BUYERS:      parseInt(process.env.MIN_UNIQUE_BUYERS    || '6'),
-  MIN_BUY_SELL_RATIO:     parseFloat(process.env.MIN_BUY_SELL_RATIO || '2.5'),
-  MIN_VOLUME_SOL_WINDOW:  parseFloat(process.env.MIN_VOLUME_SOL_WINDOW || '1.5'),
-  OBSERVATION_MS:         parseInt(process.env.OBSERVATION_MS      || '40000'),
-  // Telegram (optional secondary source)
-  TELEGRAM_API_ID:   parseInt(process.env.TELEGRAM_API_ID || '0'),
-  TELEGRAM_API_HASH: process.env.TELEGRAM_API_HASH || '',
-  TELEGRAM_PHONE:    process.env.TELEGRAM_PHONE || '',
-  TELEGRAM_SESSION:  process.env.TELEGRAM_SESSION || '',
-  TELEGRAM_GROUPS:  (process.env.TELEGRAM_GROUPS || 'fomocabal').split(',').map(s => s.trim()),
-  TELEGRAM_USERS:   (process.env.TELEGRAM_USERS  || 'marvcalledit,moodyelite').split(',').map(s => s.trim()),
+  // Telegram
+  TELEGRAM_API_ID:   parseInt( process.env.TELEGRAM_API_ID   || '0'),
+  TELEGRAM_API_HASH: process.env.TELEGRAM_API_HASH  || '',
+  TELEGRAM_PHONE:    process.env.TELEGRAM_PHONE     || '',
+  TELEGRAM_SESSION:  process.env.TELEGRAM_SESSION   || '',
+  TELEGRAM_GROUPS:  (process.env.TELEGRAM_GROUPS    || 'fomocabal').split(',').map(s => s.trim()),
+  TELEGRAM_USERS:   (process.env.TELEGRAM_USERS     || 'marvcalledit,moodyelite').split(',').map(s => s.trim()),
 };
 
-// ─── BRAIN (adaptive learning) ───────────────────────────────────────────────
+// ─── BRAIN ────────────────────────────────────────────────────────────────────
 const BRAIN_FILE = './brain.json';
-const DEFAULTS = {
+const BRAIN_DEFAULTS = {
   totalTrades: 0,
   wins: 0,
   losses: 0,
@@ -59,86 +74,163 @@ const DEFAULTS = {
   streak: 0,
   bestStreak: 0,
   startingBalance: 0,
-  // Tunable trade params
-  solPerSnipe:    parseFloat(process.env.SOL_PER_SNIPE  || '0.10'),
-  tp1Pct:         75,    // sell 50 % of position at +75 %
-  tp2Pct:         100,   // sell rest at +100 % (2X)
-  trailArmPct:    55,    // arm trailing stop after +55 %
-  trailPct:       22,    // trail 22 % below peak
-  stopLossPct:    30,    // hard stop at −30 %
-  maxHoldSec:     parseInt(process.env.MAX_HOLD_SEC || '300'),
+  currentTier: 0,
+  // 24h session tracking
+  sessionStartTime: 0,
+  sessionPnl: 0,
+  sessionMultiplier: 1.0,
+  // Learned filter overrides (null = use CONFIG base)
+  learnedFilters: { maxBcPct: null, minBuyers: null, minBSR: null, minVolSOL: null },
   // Daily bookkeeping
-  dailyPnl:      0,
-  lastResetDay:  '',
+  dailyPnl: 0,
+  lastResetDay: '',
 };
 
 let brain = (() => {
   try {
     if (fs.existsSync(BRAIN_FILE)) {
       const saved = JSON.parse(fs.readFileSync(BRAIN_FILE, 'utf8'));
-      const today = new Date().toDateString();
-      if (saved.lastResetDay !== today) { saved.dailyPnl = 0; saved.lastResetDay = today; }
-      const b = { ...DEFAULTS, ...saved };
-      log(`Brain loaded | ${b.totalTrades} trades | ${b.wins}W/${b.losses}L | pnl: ${b.totalPnlSOL >= 0 ? '+' : ''}${b.totalPnlSOL.toFixed(4)} SOL`);
+      if (saved.lastResetDay !== new Date().toDateString()) {
+        saved.dailyPnl = 0;
+        saved.lastResetDay = new Date().toDateString();
+      }
+      const b = { ...BRAIN_DEFAULTS, ...saved };
+      log(`Brain | ${b.totalTrades} trades ${b.wins}W/${b.losses}L | pnl:${b.totalPnlSOL >= 0 ? '+' : ''}${b.totalPnlSOL.toFixed(4)} SOL | tier:${TIERS[b.currentTier]?.name}`);
       return b;
     }
   } catch (_) {}
-  const b = { ...DEFAULTS, lastResetDay: new Date().toDateString() };
-  return b;
+  return { ...BRAIN_DEFAULTS, lastResetDay: new Date().toDateString(), sessionStartTime: Date.now() };
 })();
 
 function saveBrain() {
   try { fs.writeFileSync(BRAIN_FILE, JSON.stringify(brain, null, 2)); } catch (_) {}
 }
 
-function adaptBrain() {
-  if (brain.totalTrades < 5) return;
-  const recent = brain.recentTrades.slice(-10);
-  const wr = recent.length ? recent.filter(t => t.pnl > 0).length / recent.length : 0.5;
+function getTier() { return TIERS[brain.currentTier] || TIERS[0]; }
 
-  // Size: grow on hot streaks, shrink on cold
-  if (brain.streak >= 3) {
-    brain.solPerSnipe = +Math.min(0.35, brain.solPerSnipe * 1.12).toFixed(4);
-    log(`Brain+: streak ${brain.streak} → size ${brain.solPerSnipe} SOL`);
-  } else if (brain.streak <= -2) {
-    brain.solPerSnipe = +Math.max(0.04, brain.solPerSnipe * 0.80).toFixed(4);
-    log(`Brain-: streak ${brain.streak} → size ${brain.solPerSnipe} SOL`);
-  }
-
-  // TP: tighten when struggling, loosen when winning
-  if (wr >= 0.65 && brain.streak > 0) {
-    brain.tp2Pct = Math.min(200, +(brain.tp2Pct * 1.08).toFixed(1));
-  } else if (wr < 0.35 && brain.streak < 0) {
-    brain.tp2Pct = Math.max(50, +(brain.tp2Pct * 0.90).toFixed(1));
-    brain.tp1Pct = Math.max(30, +(brain.tp1Pct * 0.90).toFixed(1));
-  }
-
-  saveBrain();
+function getWinRate(n = 20) {
+  const recent = brain.recentTrades.slice(-n);
+  return recent.length ? recent.filter(t => t.pnl > 0).length / recent.length : 0.5;
 }
 
-function recordTrade({ pnlSOL, pnlPct, holdSec, mint, reason, source }) {
-  brain.recentTrades.push({ pnl: pnlSOL, pct: pnlPct, holdSec, mint, reason, source, t: Date.now() });
-  if (brain.recentTrades.length > 60) brain.recentTrades.shift();
+// Reassess which tier we belong in after every trade.
+function updateTier() {
+  if (brain.totalTrades < 3) return;
+  const wr = getWinRate(20);
+  const streak = brain.streak;
+
+  let newTier = 0;
+  for (let i = TIERS.length - 1; i >= 0; i--) {
+    if (wr >= TIERS[i].minWR && streak >= TIERS[i].minStreak) { newTier = i; break; }
+  }
+  // Shock absorber: never drop >2 tiers at once
+  newTier = Math.max(newTier, brain.currentTier - 2);
+
+  if (newTier !== brain.currentTier) {
+    const dir = newTier > brain.currentTier ? '▲' : '▼';
+    brain.currentTier = newTier;
+    const t = TIERS[newTier];
+    log(`TIER ${dir} → ${t.name} | wr:${(wr*100).toFixed(0)}% streak:${streak} | size:${(t.balPct*100).toFixed(0)}%bal(≤${t.maxSOL}SOL) tp2:+${t.tp2Pct}% moonbag:${t.moonbag} maxPos:${t.maxPos}`);
+  }
+}
+
+// After 10+ trades, compute which entry conditions produced wins and shift
+// filter thresholds toward those values. This lets the bot self-tune to
+// whatever market regime it's in without human intervention.
+function learnFilters() {
+  if (brain.totalTrades < 10) return;
+  const winners = brain.recentTrades.slice(-40).filter(t => t.pnl > 0 && t.ctx);
+  if (winners.length < 5) return;
+
+  const avg = (key) => winners.reduce((s, t) => s + (t.ctx[key] || 0), 0) / winners.length;
+  const avgBc      = avg('bcPct');
+  const avgBuyers  = avg('uniqueBuyers');
+  const avgBSR     = avg('bsr');
+  const avgVol     = avg('volumeSOL');
+
+  // Allow up to 130% of the average winning value as new ceiling/floor,
+  // but keep hard sanity bounds.
+  brain.learnedFilters.maxBcPct  = clamp(avgBc   * 1.30,  8,  45);
+  brain.learnedFilters.minBuyers = clamp(avgBuyers * 0.70, 3,  20);
+  brain.learnedFilters.minBSR    = clamp(avgBSR   * 0.70, 1.2, 6);
+  brain.learnedFilters.minVolSOL = clamp(avgVol   * 0.70, 0.4,  6);
+
+  log(`Filters LEARNED | bc≤${brain.learnedFilters.maxBcPct.toFixed(1)}% buyers≥${brain.learnedFilters.minBuyers.toFixed(1)} bsr≥${brain.learnedFilters.minBSR.toFixed(2)} vol≥${brain.learnedFilters.minVolSOL.toFixed(2)}`);
+}
+
+// Returns the effective filter thresholds for the current tier + learned values.
+function getFilters() {
+  const m  = getTier().fMult;
+  const lf = brain.learnedFilters;
+  return {
+    maxBcPct:       lf.maxBcPct  ?? CONFIG.MAX_BONDING_CURVE_PCT,
+    minBuyers:      Math.max(3,  Math.floor((lf.minBuyers ?? CONFIG.MIN_UNIQUE_BUYERS)  * m)),
+    minBSR:         Math.max(1.2, (lf.minBSR    ?? CONFIG.MIN_BUY_SELL_RATIO)  * m),
+    minVolSOL:      Math.max(0.4, (lf.minVolSOL ?? CONFIG.MIN_VOLUME_SOL)       * m),
+    maxDevPct:      CONFIG.MAX_DEV_HOLDING_PCT * (m < 1 ? 1.15 : 1),
+    minSolInCurve:  CONFIG.MIN_SOL_IN_CURVE    * m,
+  };
+}
+
+// Session multiplier: as we make money this session, we bet proportionally larger.
+// Compounds profits back into position size without risking startup capital.
+function refreshSessionMultiplier() {
+  const pnl = brain.sessionPnl;
+  let mult;
+  if      (pnl >= 3.0) mult = 1.80;
+  else if (pnl >= 2.0) mult = 1.60;
+  else if (pnl >= 1.0) mult = 1.40;
+  else if (pnl >= 0.5) mult = 1.20;
+  else if (pnl >= 0.2) mult = 1.10;
+  else if (pnl >= 0)   mult = 1.00;
+  else if (pnl >= -0.5) mult = 0.85;
+  else                  mult = 0.70;
+
+  if (mult !== brain.sessionMultiplier) {
+    brain.sessionMultiplier = mult;
+    log(`Session mult → ${mult}x (session pnl: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} SOL)`);
+  }
+}
+
+// In the final stretch of the 24h window, push the position multiplier higher.
+// In the first hour, slightly cautious to avoid blowing up before data is gathered.
+function getTimeAggression() {
+  if (!brain.sessionStartTime) return 1.0;
+  const hrs = (Date.now() - brain.sessionStartTime) / 3_600_000;
+  if (hrs < 1)  return 0.85;
+  if (hrs < 4)  return 1.00;
+  if (hrs < 12) return 1.08;
+  if (hrs < 20) return 1.15;
+  return 1.25; // Final 4-hour sprint
+}
+
+function recordTrade({ pnlSOL, pnlPct, holdSec, mint, reason, source, ctx }) {
+  brain.recentTrades.push({ pnl: pnlSOL, pct: pnlPct, holdSec, mint, reason, source, ctx, t: Date.now() });
+  if (brain.recentTrades.length > 100) brain.recentTrades.shift();
   brain.totalTrades++;
-  brain.totalPnlSOL  = +(brain.totalPnlSOL + pnlSOL).toFixed(6);
-  brain.dailyPnl     = +(brain.dailyPnl    + pnlSOL).toFixed(6);
+  brain.totalPnlSOL = +(brain.totalPnlSOL + pnlSOL).toFixed(6);
+  brain.dailyPnl    = +(brain.dailyPnl    + pnlSOL).toFixed(6);
+  brain.sessionPnl  = +(brain.sessionPnl  + pnlSOL).toFixed(6);
   if (pnlSOL > 0) {
     brain.wins++;
-    brain.streak   = Math.max(0, brain.streak) + 1;
+    brain.streak     = Math.max(0, brain.streak) + 1;
     brain.bestStreak = Math.max(brain.bestStreak, brain.streak);
   } else {
     brain.losses++;
     brain.streak = Math.min(0, brain.streak) - 1;
   }
+  updateTier();
+  learnFilters();
+  refreshSessionMultiplier();
   saveBrain();
-  adaptBrain();
 }
 
-// ─── GLOBAL STATE ─────────────────────────────────────────────────────────────
+// ─── STATE ────────────────────────────────────────────────────────────────────
 const state = {
-  positions:      {},   // mint → PositionInfo
-  watching:       {},   // mint → WatchInfo  (observation window)
-  recentlyTraded: {},   // mint → timestamp  (30-min cooldown)
+  positions:      {},  // mint → PositionInfo
+  moonbags:       {},  // mint → MoonbagInfo (30% remainder after TP2)
+  watching:       {},  // mint → WatchInfo   (observation window)
+  recentlyTraded: {},  // mint → timestamp
   allTrades:      [],
   running:        true,
   halted:         false,
@@ -147,180 +239,163 @@ const state = {
 // ─── RPC / BALANCE ────────────────────────────────────────────────────────────
 let rpc = null;
 if (Connection && PublicKey && CONFIG.HELIUS_RPC && CONFIG.WALLET_ADDRESS) {
-  try {
-    rpc = { conn: new Connection(CONFIG.HELIUS_RPC, 'confirmed'), pk: new PublicKey(CONFIG.WALLET_ADDRESS) };
-  } catch (_) {}
+  try { rpc = { conn: new Connection(CONFIG.HELIUS_RPC, 'confirmed'), pk: new PublicKey(CONFIG.WALLET_ADDRESS) }; } catch (_) {}
 }
-
 async function getBalance() {
   if (!rpc) return null;
   try { return (await rpc.conn.getBalance(rpc.pk)) / 1e9; } catch (_) { return null; }
 }
 
-// ─── TOKEN INFO ───────────────────────────────────────────────────────────────
-async function fetchTokenInfo(mint) {
+// ─── POSITION SIZING ──────────────────────────────────────────────────────────
+function calcSize(balance) {
+  const t     = getTier();
+  const pct   = t.balPct * brain.sessionMultiplier * getTimeAggression();
+  const raw   = balance !== null ? Math.min(t.maxSOL, balance * pct) : t.maxSOL * 0.5;
+  return Math.max(0.04, +raw.toFixed(3));
+}
+
+// How long before we'll trade the same mint again.
+function getCooldownMs() {
+  const id = brain.currentTier;
+  if (id >= 4) return  5 * 60_000;
+  if (id >= 2) return 10 * 60_000;
+  return 20 * 60_000;
+}
+
+// ─── EXTERNAL DATA ────────────────────────────────────────────────────────────
+async function fetchTokenMeta(mint) {
   try {
     const r = await fetch(`https://frontend-api.pump.fun/coins/${mint}`, { timeout: 6000 });
-    if (!r.ok) return null;
-    return await r.json();
+    return r.ok ? r.json() : null;
   } catch (_) { return null; }
 }
 
-async function fetchDexPrice(mint) {
+async function fetchDex(mint) {
   try {
     const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {
       headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 6000,
     });
     if (!r.ok) return null;
     const d = await r.json();
-    if (!d.pairs || d.pairs.length === 0) return null;
-    // Prefer pump.fun pair if it exists
-    const pair = d.pairs.find(p => p.dexId === 'pumpfun') || d.pairs[0];
+    if (!d.pairs?.length) return null;
+    const p = d.pairs.find(x => x.dexId === 'pumpfun') || d.pairs[0];
     return {
-      priceUsd:      parseFloat(pair.priceUsd || '0'),
-      priceChange5m: pair.priceChange?.m5  || 0,
-      priceChange1h: pair.priceChange?.h1  || 0,
-      liquidity:     pair.liquidity?.usd   || 0,
-      volume5m:      pair.volume?.m5       || 0,
-      fdv:           pair.fdv              || 0,
+      priceUsd:  parseFloat(p.priceUsd || '0'),
+      ch5m:      p.priceChange?.m5  || 0,
+      ch1h:      p.priceChange?.h1  || 0,
+      vol5m:     p.volume?.m5       || 0,
+      liqUsd:    p.liquidity?.usd   || 0,
     };
   } catch (_) { return null; }
 }
 
 // ─── TRADE EXECUTION ──────────────────────────────────────────────────────────
-async function executeTrade(action, mint, amount, denominatedInSol = true, slippage = 20, retries = 2) {
-  const url = `https://pumpportal.fun/api/trade?api-key=${CONFIG.PUMPPORTAL_KEY}`;
-  const body = {
-    action,
-    mint,
-    amount,
-    denominatedInSol: denominatedInSol ? 'true' : 'false',
-    slippage,
-    priorityFee: 0.005,
-    pool: 'pump',
-  };
-  for (let attempt = 0; attempt <= retries; attempt++) {
+async function exec(action, mint, amount, denominatedInSol = true, slippage = 20, retries = 2) {
+  const url  = `https://pumpportal.fun/api/trade?api-key=${CONFIG.PUMPPORTAL_KEY}`;
+  const body = { action, mint, amount, denominatedInSol: denominatedInSol ? 'true' : 'false', slippage, priorityFee: 0.005, pool: 'pump' };
+  for (let i = 0; i <= retries; i++) {
     try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        timeout: 15000,
-      });
+      const res  = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), timeout: 15000 });
       const text = await res.text();
       let data;
       try { data = JSON.parse(text); } catch (_) { throw new Error(`Non-JSON: ${text.slice(0, 80)}`); }
       if (Array.isArray(data) && data[0]) return data[0];
       if (data?.signature) return data.signature;
       if (typeof data === 'string' && data.length > 20) return data;
-      throw new Error(`Trade API: ${JSON.stringify(data).slice(0, 120)}`);
+      throw new Error(`API: ${JSON.stringify(data).slice(0, 100)}`);
     } catch (e) {
-      if (attempt === retries) throw e;
-      await sleep(1500 * (attempt + 1));
+      if (i === retries) throw e;
+      await sleep(1500 * (i + 1));
     }
   }
 }
 
-// ─── ENTRY FILTER ─────────────────────────────────────────────────────────────
-// Returns { pass: bool, reason: string, score: number }
+// ─── ENTRY SCORING ────────────────────────────────────────────────────────────
 function scoreEntry(watch) {
   const { meta, stats } = watch;
-  const reasons = [];
-  let score = 0;
+  const f  = getFilters();
+  const buyers = stats.uniqueBuyers instanceof Set ? stats.uniqueBuyers.size : (stats.uniqueBuyers || 0);
+  const bcPct  = meta?.bondingCurveProgress ?? calcBcPct(stats.solInCurve);
+  const bsr    = stats.sells > 0 ? stats.buys / stats.sells : stats.buys;
 
-  // ── Hard filters (any fail = reject) ────────────────────────────────────────
-  const bcPct = meta?.bondingCurveProgress ?? calcBcPct(stats.solInCurve);
-  if (bcPct > CONFIG.MAX_BONDING_CURVE_PCT) {
-    return { pass: false, reason: `bc_pct=${bcPct.toFixed(1)}%>max` };
-  }
-  if (stats.solInCurve < CONFIG.MIN_SOL_IN_CURVE) {
-    return { pass: false, reason: `sol_in_curve=${stats.solInCurve.toFixed(2)}<min` };
-  }
-  if ((meta?.devHoldingPct || 0) > CONFIG.MAX_DEV_HOLDING_PCT) {
-    return { pass: false, reason: `dev_holding=${meta.devHoldingPct.toFixed(1)}%>max` };
-  }
-  const cooldown30min = 30 * 60 * 1000;
-  if (state.recentlyTraded[watch.mint] && Date.now() - state.recentlyTraded[watch.mint] < cooldown30min) {
-    return { pass: false, reason: 'cooldown' };
-  }
-  if (meta?.complete) {
-    return { pass: false, reason: 'already_graduated' };
-  }
+  // Hard gates — one failure = no trade
+  if (meta?.complete)                          return fail(`graduated`);
+  if (bcPct > f.maxBcPct)                      return fail(`bc=${bcPct.toFixed(1)}%>max(${f.maxBcPct.toFixed(1)}%)`);
+  if (stats.solInCurve < f.minSolInCurve)      return fail(`sol=${stats.solInCurve.toFixed(2)}<min`);
+  if ((meta?.devHoldingPct || 0) > f.maxDevPct) return fail(`dev=${(meta?.devHoldingPct||0).toFixed(1)}%>max`);
+  if (isOnCooldown(watch.mint))                return fail(`cooldown`);
+  if (buyers < f.minBuyers)                    return fail(`buyers=${buyers}<min(${f.minBuyers})`);
+  if (stats.volumeSolWindow < f.minVolSOL)     return fail(`vol=${stats.volumeSolWindow.toFixed(2)}<min(${f.minVolSOL.toFixed(2)})`);
+  if (bsr < f.minBSR)                          return fail(`bsr=${bsr.toFixed(1)}<min(${f.minBSR.toFixed(2)})`);
+  if (stats.priceAtEnd <= stats.priceAtStart || stats.priceAtStart === 0) return fail(`no_momentum`);
 
-  // ── Scored filters ───────────────────────────────────────────────────────────
-  if (stats.uniqueBuyers >= CONFIG.MIN_UNIQUE_BUYERS) { score += 30; reasons.push(`buyers:${stats.uniqueBuyers}`); }
-  else return { pass: false, reason: `buyers=${stats.uniqueBuyers}<min` };
+  const momentumPct = ((stats.priceAtEnd - stats.priceAtStart) / stats.priceAtStart) * 100;
+  if (momentumPct < 5)                         return fail(`momentum_weak(${momentumPct.toFixed(1)}%)`);
 
-  if (stats.volumeSolWindow >= CONFIG.MIN_VOLUME_SOL_WINDOW) { score += 25; reasons.push(`vol:${stats.volumeSolWindow.toFixed(2)}SOL`); }
-  else return { pass: false, reason: `vol=${stats.volumeSolWindow.toFixed(2)}<min` };
+  // Score signal strength (used for logging / future ML)
+  let score = 60; // base for passing all hard gates
+  if (bsr >= f.minBSR * 1.8)      score += 15;
+  if (buyers >= f.minBuyers * 1.5) score += 10;
+  if (stats.largeBuys >= 3)        score += 10;
+  if (momentumPct >= 20)           score += 10;
+  if (bcPct <= 10)                 score +=  5; // very early
 
-  const bsr = stats.sells > 0 ? stats.buys / stats.sells : stats.buys;
-  if (bsr >= CONFIG.MIN_BUY_SELL_RATIO) { score += 25; reasons.push(`bsr:${bsr.toFixed(1)}`); }
-  else return { pass: false, reason: `bsr=${bsr.toFixed(1)}<min` };
-
-  // Momentum: price went up during observation (required)
-  if (stats.priceAtEnd > stats.priceAtStart && stats.priceAtStart > 0) {
-    const momentum = ((stats.priceAtEnd - stats.priceAtStart) / stats.priceAtStart) * 100;
-    if (momentum > 5) { score += 20; reasons.push(`momentum:+${momentum.toFixed(0)}%`); }
-  } else {
-    return { pass: false, reason: 'no_upward_momentum' };
-  }
-
-  // Bonus: large buys (>0.5 SOL each) are a bullish signal
-  if (stats.largeBuys >= 2) { score += 10; reasons.push(`largeBuys:${stats.largeBuys}`); }
-
-  return { pass: true, reason: reasons.join(' | '), score };
+  return {
+    pass: true, score,
+    reason: `bc:${bcPct.toFixed(1)}% buyers:${buyers} bsr:${bsr.toFixed(1)} vol:${stats.volumeSolWindow.toFixed(2)} mom:+${momentumPct.toFixed(0)}%`,
+    ctx: { bcPct, uniqueBuyers: buyers, bsr, volumeSOL: stats.volumeSolWindow, price: stats.priceAtEnd },
+  };
 }
 
-function calcBcPct(solInCurve) {
-  return Math.min(100, (solInCurve / 793) * 100);
+function fail(reason) { return { pass: false, reason }; }
+
+function isOnCooldown(mint) {
+  return state.recentlyTraded[mint] && Date.now() - state.recentlyTraded[mint] < getCooldownMs();
 }
 
-// ─── SNIPE (BUY) ──────────────────────────────────────────────────────────────
-async function snipe(mint, source, entryCtx = {}) {
-  if (state.halted)                                     { log(`HALTED – skipping ${mint.slice(0,8)}`); return; }
-  if (state.positions[mint])                            return;
-  if (state.watching[mint])                             return;
-  if (state.recentlyTraded[mint] && Date.now() - state.recentlyTraded[mint] < 30 * 60 * 1000) return;
-  if (Object.keys(state.positions).length >= CONFIG.MAX_POSITIONS) { log(`Max positions hit`); return; }
+// ─── SNIPE ────────────────────────────────────────────────────────────────────
+async function snipe(mint, source, ctx = {}) {
+  if (state.halted)                          { log(`HALTED – skip ${mint.slice(0,8)}`); return; }
+  if (state.positions[mint] || state.watching[mint] || state.moonbags[mint]) return;
+  if (isOnCooldown(mint))                    return;
+
+  const t = getTier();
+  if (Object.keys(state.positions).length >= t.maxPos) { log(`Max pos (${t.maxPos}) [${t.name}]`); return; }
 
   const balBefore = await getBalance();
-  const size = brain.solPerSnipe;
+  const size      = calcSize(balBefore);
+
   if (balBefore !== null && balBefore < size + 0.015) {
-    log(`Low balance: ${balBefore.toFixed(4)} SOL < ${(size + 0.015).toFixed(3)}`);
+    log(`Low bal: ${balBefore.toFixed(4)} SOL`);
     return;
   }
 
-  log(`SNIPE [${source}] ${mint.slice(0,8)} | ${size.toFixed(3)} SOL | bc%:${(entryCtx.bcPct||0).toFixed(1)} buyers:${entryCtx.uniqueBuyers||'?'}`);
+  log(`SNIPE [${source}] [${t.name}] ${mint.slice(0,8)} | ${size.toFixed(3)} SOL | bc:${(ctx.bcPct||0).toFixed(1)}% buyers:${ctx.uniqueBuyers||'?'} score:${ctx.score||'?'}`);
   try {
-    const sig = await executeTrade('buy', mint, size, true);
+    const sig      = await exec('buy', mint, size, true);
     await sleep(3500);
     const balAfter = await getBalance();
-    const spent = (balBefore !== null && balAfter !== null) ? balBefore - balAfter : size;
+    const spent    = (balBefore !== null && balAfter !== null) ? balBefore - balAfter : size;
 
-    log(`BUY ✓ | spent:${spent.toFixed(4)} SOL | bal:${balAfter?.toFixed(4) ?? '?'} | sig:${sig.slice(0,20)}…`);
+    log(`BUY ✓ | spent:${spent.toFixed(4)} SOL | bal:${balAfter?.toFixed(4) ?? '?'} | ${sig.slice(0,20)}…`);
     state.positions[mint] = {
       mint,
       entryTime:  Date.now(),
       totalSpent: spent,
       balBefore,
-      // Price tracking (set by position monitor from WebSocket or DexScreener)
-      entryPrice:  entryCtx.price || 0,
-      peakPrice:   entryCtx.price || 0,
-      peakPct:     0,
-      trailArmed:  false,
-      tp1Hit:      false,
+      peakPct:    0,
+      trailArmed: false,
+      tp1Hit:     false,
       source,
-      ctx: entryCtx,
+      ctx,
+      tierId: brain.currentTier,
     };
-    state.allTrades.push({ type: 'BUY', mint, sol: spent, sig, source, t: Date.now() });
+    state.allTrades.push({ type: 'BUY', mint, sol: spent, sig, source, tier: t.name, t: Date.now() });
     persistState();
 
-    // Hard time stop
-    setTimeout(() => { if (state.positions[mint]) exitPosition(mint, 'TIMEOUT'); },
-               brain.maxHoldSec * 1000);
+    setTimeout(() => { if (state.positions[mint]) exitPosition(mint, 'TIMEOUT'); }, t.maxHoldSec * 1000);
   } catch (e) {
-    log(`Snipe failed ${mint.slice(0,8)}: ${e.message}`);
+    log(`Snipe fail ${mint.slice(0,8)}: ${e.message}`);
   }
 }
 
@@ -329,58 +404,123 @@ async function exitPosition(mint, reason, portion = '100%') {
   const pos = state.positions[mint];
   if (!pos) return;
 
+  const t      = TIERS[pos.tierId] || getTier();
   const isFull = portion === '100%';
-  log(`EXIT ${mint.slice(0,8)} | reason:${reason} | portion:${portion}`);
+
+  // On TP2 hit at a moonbag tier, sell 70% now and let 30% ride.
+  // Only applies when we're hitting a genuine TP2, not a stop/timeout.
+  const shouldMoonbag = isFull && t.moonbag && !state.moonbags[mint] &&
+    ['TAKE_PROFIT', 'TP2'].includes(reason);
+
+  const sellPct = shouldMoonbag ? '70%' : portion;
+  log(`EXIT ${mint.slice(0,8)} | ${reason} | ${sellPct} | [${t.name}]`);
+
   try {
-    const balBefore = await getBalance();
-    const sig = await executeTrade('sell', mint, portion, false, 25);
+    const sig      = await exec('sell', mint, sellPct, false, 25);
     await sleep(3500);
     const balAfter = await getBalance();
-    const holdSec = (Date.now() - pos.entryTime) / 1000;
+    const holdSec  = (Date.now() - pos.entryTime) / 1000;
 
-    if (isFull) {
-      const pnlSOL = (balBefore !== null && pos.balBefore !== null)
-        ? balAfter - pos.balBefore
-        : 0;
+    if (shouldMoonbag) {
+      // Record the partial 70% exit as the "main" trade
+      const pnlSOL = balAfter !== null && pos.balBefore !== null ? balAfter - pos.balBefore : 0;
       const pnlPct = pos.totalSpent > 0 ? (pnlSOL / pos.totalSpent) * 100 : 0;
+      log(`TP2 70% sold | pnl so far: ${pnlSOL >= 0 ? '+' : ''}${pnlSOL.toFixed(4)} SOL (${pnlPct.toFixed(1)}%) | MOONBAG 30% riding…`);
 
-      log(`SELL ✓ | bal:${balAfter?.toFixed(4) ?? '?'} | pnl:${pnlSOL >= 0 ? '+' : ''}${pnlSOL.toFixed(4)} SOL (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%) | hold:${holdSec.toFixed(0)}s`);
-      log(`${pnlSOL > 0.001 ? '[WIN]' : pnlSOL < -0.001 ? '[LOSS]' : '[FLAT]'} ${brain.wins}W/${brain.losses}L | streak:${brain.streak} | totalPnl:${brain.totalPnlSOL >= 0 ? '+' : ''}${brain.totalPnlSOL.toFixed(4)} SOL`);
+      state.allTrades.push({ type: 'SELL_70', mint, pnl: pnlSOL, pct: pnlPct, reason, sig, t: Date.now() });
+      recordTrade({ pnlSOL, pnlPct, holdSec, mint, reason, source: pos.source, ctx: pos.ctx });
+      delete state.positions[mint];
 
+      // Activate moonbag — 30% remains on-chain; monitor with loose trailing stop
+      state.moonbags[mint] = {
+        mint,
+        balAfter70: balAfter,   // basis for moonbag PnL
+        peakPct:  pos.peakPct,
+        source:   pos.source,
+        ctx:      pos.ctx,
+        tierId:   pos.tierId,
+        activatedAt: Date.now(),
+        expiresAt:   Date.now() + 5 * 60_000, // 5 more minutes max
+      };
+      log(`MOONBAG activated ${mint.slice(0,8)} | 30% riding | expires 5 min`);
+    } else if (isFull) {
+      const pnlSOL = balAfter !== null && pos.balBefore !== null ? balAfter - pos.balBefore : 0;
+      const pnlPct = pos.totalSpent > 0 ? (pnlSOL / pos.totalSpent) * 100 : 0;
+      log(`SELL ✓ | ${pnlSOL >= 0 ? '+' : ''}${pnlSOL.toFixed(4)} SOL (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%) | hold:${holdSec.toFixed(0)}s`);
+      log(`${pnlSOL > 0.001 ? '[WIN]' : pnlSOL < -0.001 ? '[LOSS]' : '[FLAT]'} ${brain.wins}W/${brain.losses}L streak:${brain.streak} | ${brain.totalPnlSOL >= 0 ? '+' : ''}${brain.totalPnlSOL.toFixed(4)} SOL total`);
       state.allTrades.push({ type: 'SELL', mint, pnl: pnlSOL, pct: pnlPct, reason, sig, t: Date.now() });
       delete state.positions[mint];
       state.recentlyTraded[mint] = Date.now();
-      recordTrade({ pnlSOL, pnlPct, holdSec, mint, reason, source: pos.source });
-
-      if (brain.dailyPnl <= -CONFIG.DAILY_LOSS_LIMIT_SOL) {
+      recordTrade({ pnlSOL, pnlPct, holdSec, mint, reason, source: pos.source, ctx: pos.ctx });
+      if (brain.dailyPnl <= -CONFIG.DAILY_LOSS_LIMIT) {
         state.halted = true;
-        log(`*** HALTED: daily loss limit (${brain.dailyPnl.toFixed(4)} SOL today). Will resume tomorrow. ***`);
+        log(`*** HALTED: daily loss limit hit (${brain.dailyPnl.toFixed(4)} SOL) ***`);
       }
     } else {
-      // Partial exit: update basis so final PnL calc is correct
-      pos.balBefore = balAfter;
-      pos.totalSpent *= 0.5; // rough adjustment for remaining half
-      pos.tp1Hit = true;
-      log(`PARTIAL SELL ✓ | new basis:${balAfter?.toFixed(4) ?? '?'} | hold:${holdSec.toFixed(0)}s`);
+      // Partial TP1: 50% sold, update basis
+      log(`TP1 partial ✓ | new basis bal:${balAfter?.toFixed(4) ?? '?'} | hold:${holdSec.toFixed(0)}s`);
+      pos.balBefore  = balAfter;
+      pos.totalSpent = +(pos.totalSpent * 0.5).toFixed(6);
+      pos.tp1Hit     = true;
     }
     persistState();
   } catch (e) {
-    log(`Exit failed ${mint.slice(0,8)}: ${e.message}`);
-    // On sell failure, still remove from positions to avoid stuck state
-    if (isFull) {
-      delete state.positions[mint];
-      state.recentlyTraded[mint] = Date.now();
-    }
+    log(`Exit fail ${mint.slice(0,8)}: ${e.message}`);
+    if (isFull) { delete state.positions[mint]; state.recentlyTraded[mint] = Date.now(); }
   }
 }
 
-// ─── POSITION MONITOR ────────────────────────────────────────────────────────
-// Runs every 5 s. Uses DexScreener for price; WebSocket events supplement this.
-async function positionMonitorLoop() {
+// ─── MOONBAG MONITOR ─────────────────────────────────────────────────────────
+async function checkMoonbag(mint) {
+  const mb = state.moonbags[mint];
+  if (!mb) return;
+
+  if (Date.now() > mb.expiresAt) {
+    return closeMoonbag(mint, 'MOONBAG_EXPIRED');
+  }
+
+  const dex = await fetchDex(mint);
+  if (!dex) return;
+
+  const changePct = Math.max(dex.ch5m, dex.ch1h);
+  if (changePct > mb.peakPct) mb.peakPct = changePct;
+
+  // Moonbag trail: 35% drop from its own peak (looser than main position)
+  const dropFromPeak = mb.peakPct - changePct;
+  if (dropFromPeak >= 35) {
+    return closeMoonbag(mint, 'MOONBAG_TRAIL');
+  }
+}
+
+async function closeMoonbag(mint, reason) {
+  const mb = state.moonbags[mint];
+  if (!mb) return;
+  log(`MOONBAG EXIT ${mint.slice(0,8)} | ${reason} | peak was +${mb.peakPct.toFixed(1)}%`);
+  try {
+    const sig      = await exec('sell', mint, '100%', false, 30);
+    await sleep(3500);
+    const balAfter = await getBalance();
+    const bonusPnl = (balAfter !== null && mb.balAfter70 !== null) ? balAfter - mb.balAfter70 : 0;
+    log(`MOONBAG ✓ | bonus: ${bonusPnl >= 0 ? '+' : ''}${bonusPnl.toFixed(4)} SOL | sig:${sig.slice(0,20)}…`);
+    // Moonbag bonus goes straight into session/daily PnL without a full trade record
+    brain.totalPnlSOL = +(brain.totalPnlSOL + bonusPnl).toFixed(6);
+    brain.dailyPnl    = +(brain.dailyPnl    + bonusPnl).toFixed(6);
+    brain.sessionPnl  = +(brain.sessionPnl  + bonusPnl).toFixed(6);
+    saveBrain();
+    state.allTrades.push({ type: 'MOONBAG', mint, pnl: bonusPnl, reason, sig, t: Date.now() });
+  } catch (e) {
+    log(`Moonbag exit fail ${mint.slice(0,8)}: ${e.message}`);
+  }
+  delete state.moonbags[mint];
+  state.recentlyTraded[mint] = Date.now();
+  persistState();
+}
+
+// ─── POSITION MONITOR LOOP ────────────────────────────────────────────────────
+async function monitorLoop() {
   while (state.running) {
-    for (const mint of Object.keys(state.positions)) {
-      await checkPosition(mint);
-    }
+    for (const mint of Object.keys(state.positions)) await checkPosition(mint);
+    for (const mint of Object.keys(state.moonbags))  await checkMoonbag(mint);
     await sleep(5000);
   }
 }
@@ -388,119 +528,87 @@ async function positionMonitorLoop() {
 async function checkPosition(mint) {
   const pos = state.positions[mint];
   if (!pos) return;
+  const t = TIERS[pos.tierId] || getTier();
 
-  // Try DexScreener first; fall back to bonding-curve price from watch stats
+  const dex = await fetchDex(mint);
   let changePct = 0;
-  const dex = await fetchDexPrice(mint);
+
   if (dex) {
-    // Best estimate: use the max of 5m / 1h price change as proxy for our gain
-    // (We entered early so our gain ≥ the 5m candle in most cases)
-    const raw = Math.max(dex.priceChange5m, dex.priceChange1h);
-    const rawLow = Math.min(dex.priceChange5m, dex.priceChange1h);
-    changePct = raw;
-
-    // Detect volume collapse — early exit signal
-    if (dex.volume5m < 50 && pos.peakPct > 20) {
-      log(`Volume collapse on ${mint.slice(0,8)} (vol5m=$${dex.volume5m.toFixed(0)}) — exiting`);
-      await exitPosition(mint, 'VOL_COLLAPSE');
-      return;
+    changePct = Math.max(dex.ch5m, dex.ch1h);
+    // Volume collapse: if volume dies while we're up, exit before the dump
+    if (dex.vol5m < 50 && pos.peakPct > 15) {
+      log(`Vol collapse ${mint.slice(0,8)} (vol5m=$${dex.vol5m.toFixed(0)}) — exit`);
+      return exitPosition(mint, 'VOL_COLLAPSE');
     }
-
-    log(`Monitor ${mint.slice(0,8)} | 5m:${dex.priceChange5m.toFixed(1)}% 1h:${dex.priceChange1h.toFixed(1)}% | peak:${pos.peakPct.toFixed(1)}%`);
-  } else if (pos.wsPrice) {
-    // WebSocket-derived price (updated by pumpfun feed)
-    if (pos.entryPrice > 0) {
-      changePct = ((pos.wsPrice - pos.entryPrice) / pos.entryPrice) * 100;
-    }
+    log(`Monitor ${mint.slice(0,8)} | 5m:${dex.ch5m.toFixed(1)}% 1h:${dex.ch1h.toFixed(1)}% | peak:${pos.peakPct.toFixed(1)}% [${t.name}]`);
+  } else if (pos.wsPrice && pos.entryPrice > 0) {
+    changePct = ((pos.wsPrice - pos.entryPrice) / pos.entryPrice) * 100;
   }
 
-  // Update peak
-  if (changePct > pos.peakPct) {
-    pos.peakPct = changePct;
-    if (pos.entryPrice > 0 && dex?.priceUsd) {
-      pos.peakPrice = dex.priceUsd;
-    }
-  }
+  if (changePct > pos.peakPct) pos.peakPct = changePct;
 
-  // ── Partial TP1: sell 50 % at brain.tp1Pct gain ───────────────────────────
-  if (!pos.tp1Hit && changePct >= brain.tp1Pct) {
-    log(`TP1 hit ${mint.slice(0,8)} at +${changePct.toFixed(1)}% — selling 50 %`);
-    await exitPosition(mint, 'TP1_PARTIAL', '50%');
-    return;
+  // TP1: sell 50% at tier's tp1Pct to lock partial profit
+  if (!pos.tp1Hit && changePct >= t.tp1Pct) {
+    log(`TP1 ${mint.slice(0,8)} +${changePct.toFixed(1)}% — selling 50%`);
+    return exitPosition(mint, 'TP1', '50%');
   }
-
-  // ── Hard TP2: sell 100 % at brain.tp2Pct gain ─────────────────────────────
-  if (changePct >= brain.tp2Pct) {
-    log(`TP2 hit ${mint.slice(0,8)} at +${changePct.toFixed(1)}% — full exit`);
-    await exitPosition(mint, 'TAKE_PROFIT');
-    return;
+  // TP2: sell 100% (or 70% if moonbag) at tier's tp2Pct
+  if (changePct >= t.tp2Pct) {
+    log(`TP2 ${mint.slice(0,8)} +${changePct.toFixed(1)}%`);
+    return exitPosition(mint, 'TAKE_PROFIT');
   }
-
-  // ── Trailing stop ─────────────────────────────────────────────────────────
-  if (!pos.trailArmed && pos.peakPct >= brain.trailArmPct) {
+  // Trailing stop: arm after trailArm%, trail trailPct% below peak
+  if (!pos.trailArmed && pos.peakPct >= t.trailArm) {
     pos.trailArmed = true;
-    log(`Trail ARMED on ${mint.slice(0,8)} (peak:${pos.peakPct.toFixed(1)}%)`);
+    log(`Trail ARMED ${mint.slice(0,8)} peak:${pos.peakPct.toFixed(1)}%`);
   }
-  if (pos.trailArmed) {
-    const dropFromPeak = pos.peakPct - changePct;
-    if (dropFromPeak >= brain.trailPct) {
-      log(`Trail STOP ${mint.slice(0,8)} | peak:${pos.peakPct.toFixed(1)}% drop:${dropFromPeak.toFixed(1)}%`);
-      await exitPosition(mint, 'TRAIL_STOP');
-      return;
-    }
+  if (pos.trailArmed && pos.peakPct - changePct >= t.trailPct) {
+    log(`Trail STOP ${mint.slice(0,8)} peak:${pos.peakPct.toFixed(1)}% now:${changePct.toFixed(1)}%`);
+    return exitPosition(mint, 'TRAIL_STOP');
   }
-
-  // ── Hard stop-loss ────────────────────────────────────────────────────────
-  if (changePct <= -brain.stopLossPct) {
-    log(`Stop LOSS ${mint.slice(0,8)} at ${changePct.toFixed(1)}%`);
-    await exitPosition(mint, 'STOP_LOSS');
-    return;
+  // Hard stop-loss
+  if (changePct <= -t.slPct) {
+    log(`SL ${mint.slice(0,8)} ${changePct.toFixed(1)}%`);
+    return exitPosition(mint, 'STOP_LOSS');
   }
 }
 
 // ─── PUMPFUN WEBSOCKET ────────────────────────────────────────────────────────
-// Listens for new token launches and early trade flow to find high-momentum entries.
-function startPumpFunWebSocket() {
-  const WS_URL = 'wss://pumpportal.fun/api/data';
-  let ws, reconnectDelay = 2000;
+function startPumpFunWS() {
+  const URL = 'wss://pumpportal.fun/api/data';
+  let ws, delay = 2000;
 
   function connect() {
     log(`PumpFun WS: connecting…`);
-    ws = new WebSocket(WS_URL);
+    ws = new WebSocket(URL);
 
     ws.on('open', () => {
-      reconnectDelay = 2000;
-      log(`PumpFun WS: connected`);
-      // Subscribe to all new token launches
+      delay = 2000;
+      log(`PumpFun WS: connected — subscribing to new tokens`);
       ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
     });
 
     ws.on('message', async (raw) => {
       let evt;
       try { evt = JSON.parse(raw); } catch (_) { return; }
-      if (!evt || !evt.mint) return;
+      if (!evt?.mint) return;
 
       const mint = evt.mint;
 
-      // ── New token event ──────────────────────────────────────────────────────
+      // ── New token created ────────────────────────────────────────────────────
       if (evt.txType === 'create') {
         if (state.positions[mint] || state.watching[mint] || state.recentlyTraded[mint]) return;
-
-        const devWallet = evt.traderPublicKey;
         const solInCurve = (evt.vSolInBondingCurve || 0) / 1e9;
-        const initBuySOL = (evt.initialBuy || 0) / 1e9;
-        const price = calcPrice(evt.vSolInBondingCurve, evt.vTokensInBondingCurve);
+        const initBuy    = (evt.initialBuy         || 0) / 1e9;
+        if (solInCurve < 0.5) return;
+        if (initBuy > 5)      return; // dev sniped hard = suspicious
 
-        // Quick pre-filter before observation window
-        if (solInCurve < 0.5) return; // Too thin at launch
-        if (initBuySOL > 5) return;   // Dev sniped their own token aggressively
+        const price = bcPrice(evt.vSolInBondingCurve, evt.vTokensInBondingCurve);
+        log(`NEW ${mint.slice(0,8)} | initBuy:${initBuy.toFixed(3)} SOL | price:${price.toExponential(3)}`);
 
-        log(`NEW TOKEN ${mint.slice(0,8)} | dev:${devWallet.slice(0,8)} | initBuy:${initBuySOL.toFixed(3)} SOL`);
-
-        // Start observation window
         state.watching[mint] = {
           mint,
-          devWallet,
+          devWallet: evt.traderPublicKey,
           startTime: Date.now(),
           stats: {
             buys: 0, sells: 0,
@@ -508,69 +616,58 @@ function startPumpFunWebSocket() {
             uniqueBuyers: new Set(),
             largeBuys: 0,
             priceAtStart: price,
-            priceAtEnd: price,
+            priceAtEnd:   price,
             solInCurve,
           },
           meta: {
             bondingCurveProgress: calcBcPct(solInCurve),
-            devHoldingPct: initBuySOL > 0 ? (initBuySOL / (solInCurve + 0.001)) * 100 : 0,
+            devHoldingPct: solInCurve > 0 ? (initBuy / solInCurve) * 100 : 0,
             complete: false,
           },
         };
-
-        // Subscribe to this token's trades
         ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
-
-        // After observation window, evaluate entry
-        setTimeout(() => evaluateWatchedToken(mint), CONFIG.OBSERVATION_MS);
+        setTimeout(() => evaluateWatch(mint), CONFIG.OBSERVATION_MS);
       }
 
-      // ── Trade event on a watched token ──────────────────────────────────────
+      // ── Trade on watched token ───────────────────────────────────────────────
       if ((evt.txType === 'buy' || evt.txType === 'sell') && state.watching[mint]) {
-        const watch = state.watching[mint];
-        const solAmt = (evt.solAmount || 0) / 1e9;
-        const price = calcPrice(evt.vSolInBondingCurve, evt.vTokensInBondingCurve);
-        const solInCurve = (evt.vSolInBondingCurve || 0) / 1e9;
+        const w       = state.watching[mint];
+        const solAmt  = (evt.solAmount || 0) / 1e9;
+        const price   = bcPrice(evt.vSolInBondingCurve, evt.vTokensInBondingCurve);
+        const sol     = (evt.vSolInBondingCurve || 0) / 1e9;
 
-        watch.stats.solInCurve = solInCurve;
-        watch.stats.priceAtEnd = price;
-        watch.meta.bondingCurveProgress = calcBcPct(solInCurve);
+        w.stats.solInCurve   = sol;
+        w.stats.priceAtEnd   = price;
+        w.meta.bondingCurveProgress = calcBcPct(sol);
 
         if (evt.txType === 'buy') {
-          watch.stats.buys++;
-          watch.stats.volumeSolWindow += solAmt;
-          watch.stats.uniqueBuyers.add(evt.traderPublicKey);
-          if (solAmt >= 0.5) watch.stats.largeBuys++;
-          // Dev buy after launch = bad sign
-          if (evt.traderPublicKey === watch.devWallet && solAmt > 0.3) {
-            watch.meta.devHoldingPct = Math.min(100, watch.meta.devHoldingPct + 5);
-          }
+          w.stats.buys++;
+          w.stats.volumeSolWindow += solAmt;
+          w.stats.uniqueBuyers.add(evt.traderPublicKey);
+          if (solAmt >= 0.5) w.stats.largeBuys++;
         } else {
-          watch.stats.sells++;
-          // If dev is selling during observation window → abort
-          if (evt.traderPublicKey === watch.devWallet) {
-            log(`Dev DUMP on ${mint.slice(0,8)} — dropping`);
+          w.stats.sells++;
+          // Dev dumping during observation = abort immediately
+          if (evt.traderPublicKey === w.devWallet) {
+            log(`Dev SELL during obs ${mint.slice(0,8)} — aborting`);
             delete state.watching[mint];
           }
         }
-
-        // Convert Set to count for serialization
-        watch.stats.uniqueBuyersCount = watch.stats.uniqueBuyers.size;
       }
 
-      // ── Trade event on an open POSITION ─────────────────────────────────────
+      // ── Trade on open position (WebSocket price update + whale detector) ─────
       if ((evt.txType === 'buy' || evt.txType === 'sell') && state.positions[mint]) {
-        const pos = state.positions[mint];
-        const price = calcPrice(evt.vSolInBondingCurve, evt.vTokensInBondingCurve);
+        const pos   = state.positions[mint];
+        const price = bcPrice(evt.vSolInBondingCurve, evt.vTokensInBondingCurve);
         if (price > 0) pos.wsPrice = price;
 
-        // Detect whale dump: large sell that drops price ≥ 30 % fast
+        // Whale dump: large sell causes >25% drop from our peak
         if (evt.txType === 'sell') {
           const solAmt = (evt.solAmount || 0) / 1e9;
-          if (solAmt > 1.0 && pos.peakPct > 10) {
-            const newPct = pos.entryPrice > 0 ? ((price - pos.entryPrice) / pos.entryPrice) * 100 : 0;
-            if (newPct < pos.peakPct - 25) {
-              log(`Whale dump detected ${mint.slice(0,8)} (${solAmt.toFixed(2)} SOL sell) — emergency exit`);
+          if (solAmt > 1.0 && pos.peakPct > 10 && pos.entryPrice > 0) {
+            const nowPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
+            if (nowPct < pos.peakPct - 25) {
+              log(`WHALE DUMP ${mint.slice(0,8)} | ${solAmt.toFixed(2)} SOL sell | emergency exit`);
               exitPosition(mint, 'WHALE_DUMP');
             }
           }
@@ -579,190 +676,156 @@ function startPumpFunWebSocket() {
     });
 
     ws.on('close', () => {
-      log(`PumpFun WS: disconnected — reconnecting in ${reconnectDelay}ms`);
-      setTimeout(() => { reconnectDelay = Math.min(30000, reconnectDelay * 2); connect(); }, reconnectDelay);
+      log(`PumpFun WS: closed — retry in ${delay}ms`);
+      setTimeout(() => { delay = Math.min(30000, delay * 2); connect(); }, delay);
     });
-
-    ws.on('error', (e) => log(`PumpFun WS error: ${e.message}`));
+    ws.on('error', e => log(`PumpFun WS error: ${e.message}`));
   }
 
   connect();
 }
 
-async function evaluateWatchedToken(mint) {
-  const watch = state.watching[mint];
-  if (!watch) return;
+async function evaluateWatch(mint) {
+  const w = state.watching[mint];
+  if (!w) return;
 
-  // Normalize Set to count
-  if (watch.stats.uniqueBuyers instanceof Set) {
-    watch.stats.uniqueBuyers = watch.stats.uniqueBuyers.size;
-  } else {
-    watch.stats.uniqueBuyers = watch.stats.uniqueBuyersCount || watch.stats.uniqueBuyers || 0;
+  // Normalize Set → count
+  w.stats.uniqueBuyers = w.stats.uniqueBuyers instanceof Set
+    ? w.stats.uniqueBuyers.size : (w.stats.uniqueBuyers || 0);
+
+  // Pull latest dev holding data from pump.fun API
+  const meta = await fetchTokenMeta(mint);
+  if (meta) {
+    w.meta.complete = !!meta.complete;
+    if (meta.dev_buy) w.meta.devHoldingPct = (meta.dev_buy / 1_000_000_000) * 100;
   }
 
-  // Enrich with pump.fun API data (dev holdings etc.)
-  const info = await fetchTokenInfo(mint);
-  if (info) {
-    watch.meta.complete       = !!info.complete;
-    if (info.dev_buy) {
-      const totalSupply = 1_000_000_000;
-      watch.meta.devHoldingPct = (info.dev_buy / totalSupply) * 100;
-    }
-  }
-
-  const result = scoreEntry(watch);
-  log(`EVAL ${mint.slice(0,8)} | score:${result.score} | ${result.pass ? 'PASS' : 'FAIL'} | ${result.reason}`);
+  const result = scoreEntry(w);
+  log(`EVAL ${mint.slice(0,8)} | ${result.pass ? 'PASS' : 'FAIL'} score:${result.score ?? '-'} | ${result.reason}`);
 
   if (result.pass) {
-    await snipe(mint, 'PUMPFUN_WS', {
-      price:         watch.stats.priceAtEnd,
-      bcPct:         watch.meta.bondingCurveProgress,
-      uniqueBuyers:  watch.stats.uniqueBuyers,
-      score:         result.score,
-    });
+    await snipe(mint, 'PUMPFUN_WS', { ...result.ctx, score: result.score });
   }
   delete state.watching[mint];
 }
 
-// ─── TELEGRAM SOURCE (optional) ───────────────────────────────────────────────
+// ─── TELEGRAM SOURCE ─────────────────────────────────────────────────────────
 async function startTelegram() {
-  if (!TelegramClient) { log('Telegram: library not installed, skipping'); return; }
-  if (!CONFIG.TELEGRAM_API_ID || !CONFIG.TELEGRAM_API_HASH || !CONFIG.TELEGRAM_SESSION) {
-    log('Telegram: credentials not configured, skipping');
+  if (!TelegramClient || !CONFIG.TELEGRAM_API_ID || !CONFIG.TELEGRAM_SESSION) {
+    log('Telegram: skipping (not configured)');
     return;
   }
-
   try {
-    const session = new StringSession(CONFIG.TELEGRAM_SESSION);
-    const client  = new TelegramClient(session, CONFIG.TELEGRAM_API_ID, CONFIG.TELEGRAM_API_HASH, {
-      connectionRetries: 5,
-    });
+    const client = new TelegramClient(new StringSession(CONFIG.TELEGRAM_SESSION),
+      CONFIG.TELEGRAM_API_ID, CONFIG.TELEGRAM_API_HASH, { connectionRetries: 5 });
     await client.start({
       phoneNumber: async () => CONFIG.TELEGRAM_PHONE,
-      phoneCode:   async () => { throw new Error('Need TELEGRAM_SESSION env var — run auth once'); },
-      onError:     (e) => log(`Telegram error: ${e.message}`),
+      phoneCode:   async () => { throw new Error('Set TELEGRAM_SESSION in .env'); },
+      onError:     e => log(`TG error: ${e.message}`),
     });
-    log(`Telegram connected | watching groups: ${CONFIG.TELEGRAM_GROUPS.join(', ')}`);
+    log(`Telegram OK | groups: ${CONFIG.TELEGRAM_GROUPS.join(',')}`);
 
     client.addEventHandler(async (event) => {
       try {
         const msg    = event.message;
         if (!msg?.text) return;
         const sender = await msg.getSender();
-        if (!sender) return;
-        const uname  = (sender.username || '').toLowerCase();
+        const uname  = (sender?.username || '').toLowerCase();
         if (!CONFIG.TELEGRAM_USERS.includes(uname)) return;
-
-        const text = msg.text;
-        log(`TG @${uname}: ${text.slice(0, 120)}`);
-
-        const addrs = extractAddresses(text);
-        if (addrs.length === 0) return;
-
-        for (const mint of addrs) {
-          log(`TG CA: ${mint.slice(0,8)} from @${uname}`);
-          // Trusted callers skip the observation window — snipe immediately
+        log(`TG @${uname}: ${msg.text.slice(0, 100)}`);
+        for (const mint of extractAddresses(msg.text)) {
+          // Trusted callers skip the observation window
+          log(`TG CA ${mint.slice(0,8)} from @${uname} — instant snipe`);
           await snipe(mint, `TG:${uname}`, {});
         }
-      } catch (e) {
-        log(`TG handler error: ${e.message}`);
-      }
+      } catch (e) { log(`TG handler: ${e.message}`); }
     }, new NewMessage({ chats: CONFIG.TELEGRAM_GROUPS }));
   } catch (e) {
     log(`Telegram startup failed: ${e.message}`);
   }
 }
 
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+function calcBcPct(solInCurve) { return Math.min(100, (solInCurve / 793) * 100); }
+function bcPrice(vSol, vTokens) { return (!vSol || !vTokens) ? 0 : vSol / vTokens; }
+function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function extractAddresses(text) {
-  const matches = text.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/g) || [];
-  return matches.filter(m =>
-    m.length >= 32 && m.length <= 44 &&
+  return (text.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/g) || []).filter(m =>
     !m.includes('.') && !m.includes('/') &&
     m !== 'So11111111111111111111111111111111111111112' &&
     m !== '11111111111111111111111111111111'
   );
 }
-
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
-function calcPrice(vSol, vTokens) {
-  if (!vSol || !vTokens || vTokens === 0) return 0;
-  return vSol / vTokens;
-}
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
 function persistState() {
   try {
     fs.writeFileSync('./trades.json', JSON.stringify({
-      positions: state.positions,
-      allTrades: state.allTrades.slice(-200),
-      brain,
-      halted: state.halted,
+      positions: state.positions, moonbags: state.moonbags,
+      allTrades: state.allTrades.slice(-300), brain, halted: state.halted,
     }, null, 2));
   } catch (_) {}
 }
 
-// ─── STATS REPORTER ───────────────────────────────────────────────────────────
+// ─── STATS LOOP ───────────────────────────────────────────────────────────────
 async function statsLoop() {
   while (state.running) {
-    await sleep(5 * 60 * 1000);
-    const bal = await getBalance();
-    const wr  = brain.totalTrades > 0 ? ((brain.wins / brain.totalTrades) * 100).toFixed(0) : '0';
+    await sleep(5 * 60_000);
+    const bal  = await getBalance();
+    const wr   = brain.totalTrades > 0 ? ((brain.wins / brain.totalTrades) * 100).toFixed(0) : '-';
+    const hrs  = brain.sessionStartTime ? ((Date.now() - brain.sessionStartTime) / 3_600_000).toFixed(1) : '?';
+    const agg  = getTimeAggression();
     log([
-      'STATS',
+      `STATS [${hrs}h in]`,
       `bal:${bal?.toFixed(4) ?? '?'} SOL`,
-      `${brain.wins}W/${brain.losses}L (${wr}%)`,
+      `${brain.wins}W/${brain.losses}L(${wr}%)`,
       `streak:${brain.streak}`,
-      `dailyPnl:${brain.dailyPnl >= 0 ? '+' : ''}${brain.dailyPnl.toFixed(4)} SOL`,
+      `tier:${getTier().name}`,
+      `sessMult:${brain.sessionMultiplier}x`,
+      `timeAgg:${agg.toFixed(2)}x`,
+      `sessionPnl:${brain.sessionPnl >= 0 ? '+' : ''}${brain.sessionPnl.toFixed(4)} SOL`,
       `totalPnl:${brain.totalPnlSOL >= 0 ? '+' : ''}${brain.totalPnlSOL.toFixed(4)} SOL`,
-      `open:${Object.keys(state.positions).length}`,
-      `watching:${Object.keys(state.watching).length}`,
+      `open:${Object.keys(state.positions).length} moonbags:${Object.keys(state.moonbags).length}`,
     ].join(' | '));
-  }
-}
-
-// ─── STARTUP CHECKS ───────────────────────────────────────────────────────────
-function preflightCheck() {
-  const missing = [];
-  if (!CONFIG.PUMPPORTAL_KEY)  missing.push('PUMPPORTAL_KEY');
-  if (!CONFIG.WALLET_ADDRESS)  missing.push('WALLET_ADDRESS');
-  if (missing.length) {
-    log(`ERROR: missing env vars: ${missing.join(', ')}`);
-    process.exit(1);
   }
 }
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  preflightCheck();
+  const missing = ['PUMPPORTAL_KEY', 'WALLET_ADDRESS'].filter(k => !CONFIG[k]);
+  if (missing.length) { log(`ERROR: missing ${missing.join(', ')}`); process.exit(1); }
 
-  log('═══════════════════════════════════════════════════════════════');
-  log(' SOLANA MEME SNIPER — PumpFun WS + Telegram + Adaptive Brain   ');
-  log('═══════════════════════════════════════════════════════════════');
-  log(`Strategy: TP1 +${brain.tp1Pct}% (50%) | TP2 +${brain.tp2Pct}% (100%) | Trail arm +${brain.trailArmPct}% trail ${brain.trailPct}% | SL -${brain.stopLossPct}%`);
-  log(`Position: ${brain.solPerSnipe} SOL | MaxPos: ${CONFIG.MAX_POSITIONS} | Hold ≤ ${brain.maxHoldSec}s | DailyLimit: ${CONFIG.DAILY_LOSS_LIMIT_SOL} SOL`);
-  log(`Filters: minSOL:${CONFIG.MIN_SOL_IN_CURVE} BC≤${CONFIG.MAX_BONDING_CURVE_PCT}% dev≤${CONFIG.MAX_DEV_HOLDING_PCT}% buyers≥${CONFIG.MIN_UNIQUE_BUYERS} bsr≥${CONFIG.MIN_BUY_SELL_RATIO}`);
+  // Reset session tracking on each start
+  brain.sessionStartTime = Date.now();
+  brain.sessionPnl       = 0;
+  brain.sessionMultiplier = 1.0;
+  saveBrain();
+
+  log('═══════════════════════════════════════════════════════════════════');
+  log('  SOLANA MEME SNIPER v3 — Adaptive Tiers · Moonbag · 24h Sprint   ');
+  log('═══════════════════════════════════════════════════════════════════');
+  const t = getTier();
+  log(`Tier: ${t.name} | size: ${(t.balPct*100).toFixed(0)}% of bal (≤${t.maxSOL} SOL) | TP1:+${t.tp1Pct}% TP2:+${t.tp2Pct}% SL:-${t.slPct}% | moonbag:${t.moonbag}`);
+  log(`Filters: bc≤${CONFIG.MAX_BONDING_CURVE_PCT}% sol≥${CONFIG.MIN_SOL_IN_CURVE} dev≤${CONFIG.MAX_DEV_HOLDING_PCT}% buyers≥${CONFIG.MIN_UNIQUE_BUYERS} bsr≥${CONFIG.MIN_BUY_SELL_RATIO}`);
+  log(`Session: multiplier adapts with PnL | time aggression ramps to 1.25x in final 4h`);
 
   const bal = await getBalance();
-  log(`Wallet balance: ${bal?.toFixed(4) ?? 'unknown'} SOL`);
+  log(`Wallet: ${bal?.toFixed(4) ?? 'unknown'} SOL`);
   if (!brain.startingBalance && bal) { brain.startingBalance = bal; saveBrain(); }
 
-  // Start all components
-  startPumpFunWebSocket();
+  startPumpFunWS();
   await startTelegram();
-  positionMonitorLoop();
+  monitorLoop();
   statsLoop();
 
-  log('Ready. Monitoring PumpFun for runners...');
-  await new Promise(() => {}); // run forever
+  log('Ready. Hunting runners on PumpFun…');
+  await new Promise(() => {});
 }
 
 process.on('SIGINT', async () => {
-  log('Shutting down — closing all positions…');
   state.running = false;
-  for (const mint of Object.keys(state.positions)) {
-    await exitPosition(mint, 'MANUAL_STOP');
-  }
+  log('Shutting down — closing positions…');
+  for (const mint of Object.keys(state.positions)) await exitPosition(mint, 'MANUAL_STOP');
+  for (const mint of Object.keys(state.moonbags))  await closeMoonbag(mint, 'MANUAL_STOP');
   persistState();
   process.exit(0);
 });
