@@ -38,21 +38,38 @@ function tier(id, name, minWR, minStreak, balPct, maxSOL, tp1Pct, tp2Pct, trailA
   return { id, name, minWR, minStreak, balPct, maxSOL, tp1Pct, tp2Pct, trailArm, trailPct, slPct, maxPos, moonbag, fMult, maxHoldSec };
 }
 
+// ─── YOLO TIERS ───────────────────────────────────────────────────────────────
+// Used when YOLO_MODE=true. No partial TP1 (set to 9999%), moonbag always on,
+// 40-65% of balance per trade, TP2 targets 250-750%, trail arms only after 2X.
+const YOLO_TIERS = [
+  //         name      minWR  minStreak  balPct  maxSOL  tp1%   tp2%  trailArm trailPct  SL%  maxPos  moonbag  fMult  maxHoldSec
+  tier(0, 'YOLO_A',   0.00,   -99,      0.40,   0.10,   9999,  250,   100,     30,      40,    2,    true,    0.60,   480),
+  tier(1, 'YOLO_B',   0.45,     0,      0.45,   0.20,   9999,  300,   100,     28,      38,    2,    true,    0.55,   480),
+  tier(2, 'YOLO_C',   0.55,     2,      0.50,   0.35,   9999,  400,   110,     25,      36,    2,    true,    0.50,   540),
+  tier(3, 'YOLO_D',   0.62,     4,      0.55,   0.55,   9999,  500,   120,     22,      34,    3,    true,    0.45,   540),
+  tier(4, 'YOLO_E',   0.68,     6,      0.60,   0.80,   9999,  600,   130,     18,      32,    3,    true,    0.40,   600),
+  tier(5, 'YOLO_F',   0.74,     8,      0.65,   1.20,   9999,  750,   140,     15,      30,    3,    true,    0.35,   600),
+];
+
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
+const YOLO = process.env.YOLO_MODE === 'true'; // shorthand used throughout
+
 const CONFIG = {
   PUMPPORTAL_KEY:     process.env.PUMPPORTAL_KEY || '',
   HELIUS_RPC:         process.env.HELIUS_RPC || 'https://api.mainnet-beta.solana.com',
   WALLET_ADDRESS:     process.env.WALLET_ADDRESS || '',
-  DAILY_LOSS_LIMIT:   parseFloat(process.env.DAILY_LOSS_LIMIT_SOL || '1.0'),
+  YOLO_MODE:          YOLO,
+  DAILY_LOSS_LIMIT:   YOLO ? Infinity : parseFloat(process.env.DAILY_LOSS_LIMIT_SOL || '1.0'),
 
   // Base filter thresholds — scaled dynamically per tier and by learned values
-  MIN_SOL_IN_CURVE:      parseFloat(process.env.MIN_SOL_IN_CURVE      || '3.0'),
-  MAX_BONDING_CURVE_PCT: parseFloat(process.env.MAX_BONDING_CURVE_PCT || '28'),
-  MAX_DEV_HOLDING_PCT:   parseFloat(process.env.MAX_DEV_HOLDING_PCT   || '8'),
-  MIN_UNIQUE_BUYERS:     parseInt(  process.env.MIN_UNIQUE_BUYERS      || '6'),
-  MIN_BUY_SELL_RATIO:    parseFloat(process.env.MIN_BUY_SELL_RATIO     || '2.5'),
-  MIN_VOLUME_SOL:        parseFloat(process.env.MIN_VOLUME_SOL_WINDOW  || '1.5'),
-  OBSERVATION_MS:        parseInt(  process.env.OBSERVATION_MS         || '40000'),
+  // YOLO_MODE uses looser defaults; tier fMult loosens them further at runtime
+  MIN_SOL_IN_CURVE:      parseFloat(process.env.MIN_SOL_IN_CURVE      || (YOLO ? '1.5' : '3.0')),
+  MAX_BONDING_CURVE_PCT: parseFloat(process.env.MAX_BONDING_CURVE_PCT || (YOLO ? '45'  : '28')),
+  MAX_DEV_HOLDING_PCT:   parseFloat(process.env.MAX_DEV_HOLDING_PCT   || (YOLO ? '10'  : '8')),
+  MIN_UNIQUE_BUYERS:     parseInt(  process.env.MIN_UNIQUE_BUYERS      || (YOLO ? '3'   : '6')),
+  MIN_BUY_SELL_RATIO:    parseFloat(process.env.MIN_BUY_SELL_RATIO     || (YOLO ? '1.5' : '2.5')),
+  MIN_VOLUME_SOL:        parseFloat(process.env.MIN_VOLUME_SOL_WINDOW  || (YOLO ? '0.5' : '1.5')),
+  OBSERVATION_MS:        parseInt(  process.env.OBSERVATION_MS         || (YOLO ? '15000' : '40000')),
 
   // Telegram
   TELEGRAM_API_ID:   parseInt( process.env.TELEGRAM_API_ID   || '0'),
@@ -62,6 +79,9 @@ const CONFIG = {
   TELEGRAM_GROUPS:  (process.env.TELEGRAM_GROUPS    || 'fomocabal').split(',').map(s => s.trim()),
   TELEGRAM_USERS:   (process.env.TELEGRAM_USERS     || 'marvcalledit,moodyelite').split(',').map(s => s.trim()),
 };
+
+// Active tier set — swapped to YOLO_TIERS when YOLO_MODE=true
+const ACTIVE_TIERS = YOLO ? YOLO_TIERS : TIERS;
 
 // ─── BRAIN ────────────────────────────────────────────────────────────────────
 const BRAIN_FILE = './brain.json';
@@ -95,7 +115,7 @@ let brain = (() => {
         saved.lastResetDay = new Date().toDateString();
       }
       const b = { ...BRAIN_DEFAULTS, ...saved };
-      log(`Brain | ${b.totalTrades} trades ${b.wins}W/${b.losses}L | pnl:${b.totalPnlSOL >= 0 ? '+' : ''}${b.totalPnlSOL.toFixed(4)} SOL | tier:${TIERS[b.currentTier]?.name}`);
+      log(`Brain | ${b.totalTrades} trades ${b.wins}W/${b.losses}L | pnl:${b.totalPnlSOL >= 0 ? '+' : ''}${b.totalPnlSOL.toFixed(4)} SOL | tier:${ACTIVE_TIERS[b.currentTier]?.name}`);
       return b;
     }
   } catch (_) {}
@@ -106,7 +126,7 @@ function saveBrain() {
   try { fs.writeFileSync(BRAIN_FILE, JSON.stringify(brain, null, 2)); } catch (_) {}
 }
 
-function getTier() { return TIERS[brain.currentTier] || TIERS[0]; }
+function getTier() { return ACTIVE_TIERS[brain.currentTier] || ACTIVE_TIERS[0]; }
 
 function getWinRate(n = 20) {
   const recent = brain.recentTrades.slice(-n);
@@ -120,8 +140,8 @@ function updateTier() {
   const streak = brain.streak;
 
   let newTier = 0;
-  for (let i = TIERS.length - 1; i >= 0; i--) {
-    if (wr >= TIERS[i].minWR && streak >= TIERS[i].minStreak) { newTier = i; break; }
+  for (let i = ACTIVE_TIERS.length - 1; i >= 0; i--) {
+    if (wr >= ACTIVE_TIERS[i].minWR && streak >= ACTIVE_TIERS[i].minStreak) { newTier = i; break; }
   }
   // Shock absorber: never drop >2 tiers at once
   newTier = Math.max(newTier, brain.currentTier - 2);
@@ -129,7 +149,7 @@ function updateTier() {
   if (newTier !== brain.currentTier) {
     const dir = newTier > brain.currentTier ? '▲' : '▼';
     brain.currentTier = newTier;
-    const t = TIERS[newTier];
+    const t = ACTIVE_TIERS[newTier];
     log(`TIER ${dir} → ${t.name} | wr:${(wr*100).toFixed(0)}% streak:${streak} | size:${(t.balPct*100).toFixed(0)}%bal(≤${t.maxSOL}SOL) tp2:+${t.tp2Pct}% moonbag:${t.moonbag} maxPos:${t.maxPos}`);
   }
 }
@@ -150,10 +170,10 @@ function learnFilters() {
 
   // Allow up to 130% of the average winning value as new ceiling/floor,
   // but keep hard sanity bounds.
-  brain.learnedFilters.maxBcPct  = clamp(avgBc   * 1.30,  8,  45);
-  brain.learnedFilters.minBuyers = clamp(avgBuyers * 0.70, 3,  20);
-  brain.learnedFilters.minBSR    = clamp(avgBSR   * 0.70, 1.2, 6);
-  brain.learnedFilters.minVolSOL = clamp(avgVol   * 0.70, 0.4,  6);
+  brain.learnedFilters.maxBcPct  = clamp(avgBc    * 1.30, YOLO ? 5  : 8,  YOLO ? 55 : 45);
+  brain.learnedFilters.minBuyers = clamp(avgBuyers * 0.70, YOLO ? 2  : 3,  20);
+  brain.learnedFilters.minBSR    = clamp(avgBSR   * 0.70, YOLO ? 1.0 : 1.2, 6);
+  brain.learnedFilters.minVolSOL = clamp(avgVol   * 0.70, YOLO ? 0.3 : 0.4, 6);
 
   log(`Filters LEARNED | bc≤${brain.learnedFilters.maxBcPct.toFixed(1)}% buyers≥${brain.learnedFilters.minBuyers.toFixed(1)} bsr≥${brain.learnedFilters.minBSR.toFixed(2)} vol≥${brain.learnedFilters.minVolSOL.toFixed(2)}`);
 }
@@ -193,15 +213,21 @@ function refreshSessionMultiplier() {
 }
 
 // In the final stretch of the 24h window, push the position multiplier higher.
-// In the first hour, slightly cautious to avoid blowing up before data is gathered.
+// YOLO_MODE skips the cautious warmup and ramps harder — max 1.5x in final sprint.
 function getTimeAggression() {
   if (!brain.sessionStartTime) return 1.0;
   const hrs = (Date.now() - brain.sessionStartTime) / 3_600_000;
+  if (YOLO) {
+    if (hrs < 0.5) return 1.00;
+    if (hrs < 6)   return 1.10;
+    if (hrs < 16)  return 1.20;
+    return 1.50; // Final sprint: no mercy
+  }
   if (hrs < 1)  return 0.85;
   if (hrs < 4)  return 1.00;
   if (hrs < 12) return 1.08;
   if (hrs < 20) return 1.15;
-  return 1.25; // Final 4-hour sprint
+  return 1.25;
 }
 
 function recordTrade({ pnlSOL, pnlPct, holdSec, mint, reason, source, ctx }) {
@@ -255,7 +281,9 @@ function calcSize(balance) {
 }
 
 // How long before we'll trade the same mint again.
+// YOLO_MODE uses a flat 90-second cooldown — capitalize on every opportunity.
 function getCooldownMs() {
+  if (YOLO) return 90_000;
   const id = brain.currentTier;
   if (id >= 4) return  5 * 60_000;
   if (id >= 2) return 10 * 60_000;
@@ -452,7 +480,7 @@ async function exitPosition(mint, reason, portion = '100%') {
       delete state.positions[mint];
       state.recentlyTraded[mint] = Date.now();
       recordTrade({ pnlSOL, pnlPct, holdSec, mint, reason, source: pos.source, ctx: pos.ctx });
-      if (brain.dailyPnl <= -CONFIG.DAILY_LOSS_LIMIT) {
+      if (!YOLO && brain.dailyPnl <= -CONFIG.DAILY_LOSS_LIMIT) {
         state.halted = true;
         log(`*** HALTED: daily loss limit hit (${brain.dailyPnl.toFixed(4)} SOL) ***`);
       }
@@ -795,18 +823,33 @@ async function main() {
   if (missing.length) { log(`ERROR: missing ${missing.join(', ')}`); process.exit(1); }
 
   // Reset session tracking on each start
-  brain.sessionStartTime = Date.now();
-  brain.sessionPnl       = 0;
+  brain.sessionStartTime  = Date.now();
+  brain.sessionPnl        = 0;
   brain.sessionMultiplier = 1.0;
+
+  // YOLO mode: skip warmup, start at tier 3 (HOT/YOLO_D) immediately
+  if (YOLO && brain.totalTrades === 0) {
+    brain.currentTier = 3;
+    log(`YOLO_MODE: starting at tier ${ACTIVE_TIERS[3].name}`);
+  }
   saveBrain();
 
-  log('═══════════════════════════════════════════════════════════════════');
-  log('  SOLANA MEME SNIPER v3 — Adaptive Tiers · Moonbag · 24h Sprint   ');
-  log('═══════════════════════════════════════════════════════════════════');
+  if (YOLO) {
+    log('╔══════════════════════════════════════════════════════════════════╗');
+    log('║   SOLANA MEME SNIPER — YOLO MODE — SEND IT                      ║');
+    log('╚══════════════════════════════════════════════════════════════════╝');
+    log(`No loss limit | 40-65% of balance per trade | Moonbag on every win`);
+    log(`Observation: ${CONFIG.OBSERVATION_MS/1000}s | Cooldown: 90s | TP2 targets: 250-750%`);
+    log(`Time aggression: 1.0x now → 1.5x in final 4h sprint`);
+  } else {
+    log('═══════════════════════════════════════════════════════════════════');
+    log('  SOLANA MEME SNIPER v3 — Adaptive Tiers · Moonbag · 24h Sprint   ');
+    log('═══════════════════════════════════════════════════════════════════');
+    log(`Session: multiplier adapts with PnL | time aggression ramps to 1.25x in final 4h`);
+  }
   const t = getTier();
-  log(`Tier: ${t.name} | size: ${(t.balPct*100).toFixed(0)}% of bal (≤${t.maxSOL} SOL) | TP1:+${t.tp1Pct}% TP2:+${t.tp2Pct}% SL:-${t.slPct}% | moonbag:${t.moonbag}`);
+  log(`Tier: ${t.name} | size: ${(t.balPct*100).toFixed(0)}% of bal (≤${t.maxSOL} SOL) | TP1:+${t.tp1Pct === 9999 ? 'OFF' : t.tp1Pct+'%'} TP2:+${t.tp2Pct}% SL:-${t.slPct}% | moonbag:${t.moonbag}`);
   log(`Filters: bc≤${CONFIG.MAX_BONDING_CURVE_PCT}% sol≥${CONFIG.MIN_SOL_IN_CURVE} dev≤${CONFIG.MAX_DEV_HOLDING_PCT}% buyers≥${CONFIG.MIN_UNIQUE_BUYERS} bsr≥${CONFIG.MIN_BUY_SELL_RATIO}`);
-  log(`Session: multiplier adapts with PnL | time aggression ramps to 1.25x in final 4h`);
 
   const bal = await getBalance();
   log(`Wallet: ${bal?.toFixed(4) ?? 'unknown'} SOL`);
