@@ -6,6 +6,9 @@ project_id = "payoff"
 [functions.log-payment]
 verify_jwt = true
 
+[functions.link-debt-grant]
+verify_jwt = true
+
 [functions.complete-lesson]
 verify_jwt = true
 

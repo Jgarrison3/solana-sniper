@@ -1,0 +1,190 @@
+# Pay Off
+
+**You win, even if you don't.**
+
+A debt-payoff motivation app: members log their debts, earn **free** sweepstakes
+tickets by doing healthy payoff behaviors (on-time payments, extra payments,
+milestones, lessons), and enter recurring sponsor-funded **Payoff Drops** —
+drawings whose prize is paid **directly to the winner's creditor**.
+
+> Entries are always free. This is a sweepstakes, never a lottery. Nothing
+> purchasable may ever grant tickets — that rule is enforced by a database
+> CHECK constraint, an engine guard, and a unit test.
+
+## Stack
+
+- **Mobile app:** React Native + Expo SDK 56 (managed), TypeScript strict, Expo Router
+- **Backend:** Supabase — Postgres, Auth, RLS, Edge Functions (Deno)
+- **State/data:** TanStack Query + Supabase client
+
+## Setup
+
+### 1. Supabase
+
+```bash
+# install the CLI: https://supabase.com/docs/guides/cli
+supabase init        # if linking fresh; config.toml is already provided
+supabase link --project-ref <your-project-ref>
+supabase db push     # applies supabase/migrations/*.sql in order
+supabase functions deploy log-payment complete-lesson link-debt-grant amoe-entry run-draw
+```
+
+Edge function secrets (`SUPABASE_URL`, `SUPABASE_ANON_KEY`,
+`SUPABASE_SERVICE_ROLE_KEY` are injected automatically by the platform).
+Optional flag:
+
+```bash
+supabase secrets set DRAWINGS_ENABLED=true
+```
+
+### 2. Environment
+
+```bash
+cp .env.example .env   # fill in from Project Settings → API
+```
+
+`EXPO_PUBLIC_*` vars are bundled into the client; the bare
+`SUPABASE_SERVICE_ROLE_KEY` is used only by `scripts/seed.ts` and must never
+ship in the app.
+
+### 3. Install, test, seed, run
+
+```bash
+npm install
+npm test            # 54 engine tests: caps, milestones, draws, ledger, compliance
+npm run seed        # demo member, 2 debts, ~80 tickets, open drawing, 3 winners
+npm start           # Expo dev server (iOS/Android via Expo Go)
+npm run web         # web build — also how you reach /admin
+```
+
+Demo login after seeding: `demo@payoff.test` / `payoff-demo-123` (admin).
+
+### 4. Drawing cron
+
+`run-draw` is designed to be invoked on a schedule. With pg_cron + pg_net
+(Supabase dashboard → Integrations), run hourly:
+
+```sql
+select cron.schedule(
+  'run-payoff-draws', '0 * * * *',
+  $$ select net.http_post(
+       url := 'https://<project-ref>.supabase.co/functions/v1/run-draw',
+       headers := jsonb_build_object(
+         'Content-Type','application/json',
+         'Authorization','Bearer ' || '<service-role-key>'),
+       body := '{}'::jsonb) $$);
+```
+
+(Store the key in Vault rather than inline for anything beyond a sandbox.)
+
+## Architecture
+
+```
+payoff/
+├── supabase/
+│   ├── migrations/            # schema, RLS, earning-rule reference data
+│   └── functions/
+│       ├── _shared/engine/    # PURE TS domain engine (no Deno/Node APIs)
+│       │   ├── rules.ts       #   data-driven grant caps
+│       │   ├── milestones.ts  #   25/50/75/100% detection
+│       │   ├── streak.ts      #   3-month on-time streak
+│       │   ├── draw.ts        #   provably fair winner selection
+│       │   └── ledger.ts      #   append-only ledger model
+│       ├── log-payment/       # payment + full ticket engine pass
+│       ├── link-debt-grant/   # debt_linked grant (5, once/debt, max 5)
+│       ├── complete-lesson/   # daily lesson grant
+│       ├── amoe-entry/        # PUBLIC free entry (no JWT)
+│       └── run-draw/          # cron/admin drawing engine
+├── src/
+│   ├── app/                   # Expo Router: tabs, onboarding, admin, legal
+│   ├── providers/             # DebtProvider interface + ManualDebtProvider
+│   │                          #   (PlaidDebtProvider stub — TODO(plaid))
+│   ├── hooks/                 # TanStack Query hooks (only data layer screens see)
+│   ├── components/            # GoldenTicket, DebtBar, TicketCelebration…
+│   ├── legal/legal_copy.ts    # ALL sweepstakes copy, one file for counsel
+│   └── theme/tokens.ts        # ink/moss/mint/gold/brick design tokens
+├── scripts/seed.ts
+└── tests/                     # vitest suite over the shared engine
+```
+
+### Key design decisions
+
+**The engine is one pure-TS module shared by Deno and Node.** Edge functions
+import it directly; vitest tests import the same files. No logic duplication
+between "what's tested" and "what runs."
+
+**The ticket economy is data, not code.** `earning_rules` rows carry the
+tickets, units (`event` / `dollars_extra`), and every cap
+(per-day/month/debt-month, monthly ticket cap, once-per-debt, max-debts).
+`computeGrant()` interprets whatever rows exist. Changing the economy is an
+UPDATE, not a deploy.
+
+**The ledger is append-only — everywhere.** A Postgres trigger rejects
+UPDATE/DELETE on `ticket_ledger` and `audit_log` for *every* role including
+`service_role`. Corrections are compensating entries. Tickets attach to the
+next open drawing at grant time (`drawing_id`, nullable).
+
+**Drawings are provably fair.** A random seed is generated by a DB trigger at
+drawing creation; only its SHA-256 commitment is public before the draw
+(members read the `drawings_public` view, which hides the seed until status
+is `drawn`). At draw time:
+`winning_index = sha256(seed + ":" + snapshot_hash) mod total_tickets` over
+ledger entries canonically ordered by ticket id. The seed, snapshot hash, and
+proof are revealed afterward; `engine/draw.ts → verifyDraw()` lets anyone
+recompute the result. Every state transition writes an `audit_log` row.
+
+**Concierge payout — no money movement in MVP.** Winning creates a `payouts`
+row (`pending_claim`). The winner submits creditor details in-app
+(→ `claimed`); the operator pays the creditor manually and advances
+`payment_sent` → `confirmed` in the admin console. A trigger enforces the
+status path and confirming a payout flips the drawing to `paid`. Confirmed
+payouts appear in the public `winners_feed` view (first name + last initial +
+city only).
+
+**DebtProvider abstraction.** UI and hooks depend on the `DebtProvider`
+interface, wired in `src/providers/index.ts`. `ManualDebtProvider` (MVP) does
+manual entry + self-reported payments; `PlaidDebtProvider` is a stub that
+will slot in without UI changes. The `payments` table already carries
+`verified` + `source` for that future.
+
+**Feature flag.** `EXPO_PUBLIC_DRAWINGS_ENABLED=false` (client) +
+`DRAWINGS_ENABLED=false` (functions) ship the app as a pure debt tracker:
+no Drops/Earn tabs, no ticket UI, tickets attach to no drawing — for
+launching before Official Rules are finalized with counsel.
+
+**RLS.** Members read/write only their own rows. The ticket ledger is
+readable (own rows) but writable only through edge functions. `drawings` is
+admin-only at the table level; members use the seed-hiding `drawings_public`
+view. The admin console is just a guarded Expo web route — RLS (`is_admin`)
+is the real boundary.
+
+### AMOE (free alternative method of entry)
+
+`POST /functions/v1/amoe-entry` is public (no JWT) and grants 5 tickets per
+email per calendar month with **no app-account activity required**:
+
+```bash
+curl -X POST https://<ref>.supabase.co/functions/v1/amoe-entry \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"a@b.com","full_name":"A B","postal_address":"1 Main St"}'
+```
+
+Entries from emails matching a member land in their ledger; others are
+recorded in `amoe_entries` for the operator to include in draw administration
+(TODO post-MVP: auto-provision entrant identities). Member-facing
+instructions live in `legal_copy.ts → AMOE_INSTRUCTIONS`.
+
+## Compliance guardrails
+
+- `earning_rules.requires_payment_to_app` has a `CHECK (… = false)` —
+  pay-to-enter rules are unrepresentable.
+- `computeGrant()` throws `ComplianceError` if such a rule ever appears.
+- `tests/no-paid-tickets.test.ts` fails the build otherwise.
+- All sweepstakes copy lives in `src/legal/legal_copy.ts` (marked
+  DRAFT — NOT LEGAL ADVICE) for single-file counsel review.
+- Fine print ("No purchase necessary…") renders on every drawing surface.
+
+## Out of scope for MVP (TODO markers in code)
+
+Plaid (`TODO(plaid)`), real payments/escrow, push notifications (in-app
+only), premium tier (tools, never tickets), sponsor portal, referrals.
