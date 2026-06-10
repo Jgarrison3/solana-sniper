@@ -14,11 +14,17 @@ if (!url || !anonKey) {
   );
 }
 
-export const supabase = createClient(url, anonKey, {
-  auth: {
-    storage: Platform.OS === "web" ? undefined : AsyncStorage,
-    autoRefreshToken: true,
-    persistSession: true,
-    detectSessionInUrl: Platform.OS === "web",
+// Placeholder fallbacks keep static export / env-less boots from throwing;
+// real values come from .env in any working setup.
+export const supabase = createClient(
+  url || "http://localhost:54321",
+  anonKey || "missing-anon-key",
+  {
+    auth: {
+      storage: Platform.OS === "web" ? undefined : AsyncStorage,
+      autoRefreshToken: true,
+      persistSession: true,
+      detectSessionInUrl: Platform.OS === "web",
+    },
   },
-});
+);
