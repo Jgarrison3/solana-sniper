@@ -1,0 +1,17 @@
+# Supabase CLI config for Pay Off.
+# `supabase functions deploy` reads per-function settings here.
+
+project_id = "payoff"
+
+[functions.log-payment]
+verify_jwt = true
+
+[functions.complete-lesson]
+verify_jwt = true
+
+[functions.run-draw]
+verify_jwt = true
+
+# AMOE must be reachable with no account whatsoever (legal requirement).
+[functions.amoe-entry]
+verify_jwt = false
