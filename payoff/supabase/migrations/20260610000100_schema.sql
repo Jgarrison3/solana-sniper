@@ -156,7 +156,7 @@ create index drawings_status_idx on drawings (status, closes_at);
 -- commitment is published before any tickets attach.
 create function public.commit_drawing_seed()
 returns trigger
-language plpgsql security definer set search_path = public
+language plpgsql security definer set search_path = public, extensions
 as $$
 begin
   if new.rng_seed is null then
